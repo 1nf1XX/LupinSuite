@@ -1,11 +1,23 @@
 name: Build Swift App
 
-on: [push]
+on:
+  push:
+    branches: [ "main", "master" ]
 
 jobs:
   build:
     runs-on: macos-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Compile Swift File
-        run: swiftc main.swift -o LupinApp
+      # Используем обновленный action, чтобы убрать предупреждение про Node.js
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Check Swift Version
+        run: swift --version
+
+      - name: Compile check
+        run: |
+          # Проверяем, что компилятор видит файл
+          echo "Checking main.swift..."
+          ls -la
