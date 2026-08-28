@@ -14,27 +14,28 @@ jobs:
 
       - name: Компиляция Swift-файла
         run: |
-          # Ищем путь к iOS SDK на сервере GitHub
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          # Компилируем main.swift в бинарник LupinSuite под архитектуру ARM64 (iPhone)
+          # Компилируем Swift код с поддержкой SwiftUI/UIKit фреймворков
           swiftc main.swift -o LupinSuite \
             -target arm64-apple-ios15.0 \
             -sdk $SDK_PATH \
-            -O
+            -parse-as-library \
+            -Xlinker -rpath -Xlinker /System/Library/Frameworks \
+            -O || {
+              echo "Попытка прямой компиляции без parse-as-library..."
+              swiftc main.swift -o LupinSuite -target arm64-apple-ios15.0 -sdk $SDK_PATH -O
+            }
 
       - name: Сборка структуры .app и Info.plist
         run: |
-          # Создаем нужные папки
           mkdir -p Payload/LupinSuite.app
-          
-          # Переносим скомпилированный бинарник в папку приложения
           mv LupinSuite Payload/LupinSuite.app/
           
-          # Копируем иконку
-          cp AppIcon.png Payload/LupinSuite.app/
+          if [ -f AppIcon.png ]; then
+            cp AppIcon.png Payload/LupinSuite.app/
+          fi
           
-          # Генерируем минимальный Info.plist прямо из терминала
           cat <<EOF > Payload/LupinSuite.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -46,6 +47,8 @@ jobs:
               <string>com.1nf1xx.lupinsuite</string>
               <key>CFBundleName</key>
               <string>LupinSuite</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
               <key>CFBundleVersion</key>
               <string>1.0</string>
               <key>CFBundleShortVersionString</key>
@@ -56,6 +59,8 @@ jobs:
               <true/>
               <key>MinimumOSVersion</key>
               <string>15.0</string>
+              <key>UILaunchScreen</key>
+              <dict/>
           </dict>
           </plist>
           EOF
