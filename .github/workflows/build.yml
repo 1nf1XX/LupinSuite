@@ -1,67 +1,71 @@
-name: Build LupinApp with Icon
+name: Build Unsigned IPA from Swift
 
-on: [push]
+on:
+  push:
+    branches: [ "main" ]
 
 jobs:
   build:
     runs-on: macos-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
+      - name: Чекаут кода
+        uses: actions/checkout@v4
 
-      - name: Prepare App Bundle & Compile
+      - name: Компиляция Swift-файла
         run: |
-          # 1. Создаем структуру .app бандла
-          mkdir -p LupinApp.app/Contents/MacOS
-          mkdir -p LupinApp.app/Contents/Resources
+          # Ищем путь к iOS SDK на сервере GitHub
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          # 2. Компилируем твой файл в исполняемый бинарник
-          swiftc -target x86_64-apple-macos13 -framework SwiftUI -framework AppKit main.swift -o LupinApp.app/Contents/MacOS/LupinApp
+          # Компилируем main.swift в бинарник LupinSuite под архитектуру ARM64 (iPhone)
+          swiftc main.swift -o LupinSuite \
+            -target arm64-apple-ios15.0 \
+            -sdk $SDK_PATH \
+            -O
+
+      - name: Сборка структуры .app и Info.plist
+        run: |
+          # Создаем нужные папки
+          mkdir -p Payload/LupinSuite.app
           
-          # 3. Создаем Info.plist для приложения
-          cat << 'EOF' > LupinApp.app/Contents/Info.plist
+          # Переносим скомпилированный бинарник в папку приложения
+          mv LupinSuite Payload/LupinSuite.app/
+          
+          # Копируем иконку
+          cp AppIcon.png Payload/LupinSuite.app/
+          
+          # Генерируем минимальный Info.plist прямо из терминала
+          cat <<EOF > Payload/LupinSuite.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
               <key>CFBundleExecutable</key>
-              <string>LupinApp</string>
+              <string>LupinSuite</string>
               <key>CFBundleIdentifier</key>
-              <string>com.lupin.suite</string>
+              <string>com.1nf1xx.lupinsuite</string>
               <key>CFBundleName</key>
-              <string>LupinApp</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
+              <string>LupinSuite</string>
+              <key>CFBundleVersion</key>
+              <string>1.0</string>
               <key>CFBundleShortVersionString</key>
-              <string>3.0</string>
+              <string>1.0</string>
               <key>CFBundleIconFile</key>
-              <string>AppIcon</string>
+              <string>AppIcon.png</string>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>MinimumOSVersion</key>
+              <string>15.0</string>
           </dict>
           </plist>
           EOF
 
-          # 4. Если в корне репозитория лежит картинка AppIcon.png, конвертируем её в icns и добавляем
-          if [ -f "AppIcon.png" ]; then
-            mkdir icon.iconset
-            sips -z 16 16     AppIcon.png --out icon.iconset/icon_16x16.png
-            sips -z 32 32     AppIcon.png --out icon.iconset/icon_16x16@2x.png
-            sips -z 32 32     AppIcon.png --out icon.iconset/icon_32x32.png
-            sips -z 64 64     AppIcon.png --out icon.iconset/icon_32x32@2x.png
-            sips -z 128 128   AppIcon.png --out icon.iconset/icon_128x128.png
-            sips -z 256 256   AppIcon.png --out icon.iconset/icon_128x128@2x.png
-            sips -z 256 256   AppIcon.png --out icon.iconset/icon_256x256.png
-            sips -z 512 512   AppIcon.png --out icon.iconset/icon_256x256@2x.png
-            sips -z 512 512   AppIcon.png --out icon.iconset/icon_512x512.png
-            sips -z 1024 1024 AppIcon.png --out icon.iconset/icon_512x512@2x.png
-            iconutil -c icns icon.iconset -o LupinApp.app/Contents/Resources/AppIcon.icns
-          fi
+      - name: Упаковка в IPA
+        run: |
+          zip -qr LupinSuite.ipa Payload/
 
-          # 5. Упаковываем в zip для удобного скачивания
-          zip -r LupinApp.zip LupinApp.app
-
-      - name: Upload Artifact
+      - name: Выгрузка артефакта
         uses: actions/upload-artifact@v4
         with:
-          name: LupinApp-Bundle
-          path: LupinApp.zip
+          name: LupinSuite-Unsigned
+          path: LupinSuite.ipa
