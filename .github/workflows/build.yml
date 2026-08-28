@@ -16,7 +16,7 @@ jobs:
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          # 1. Компилируем в объектный файл с таргетом iOS 16.0
+          # 1. Компилируем main.swift в объектный файл с поддержкой iOS 16.0
           swiftc -c main.swift \
             -target arm64-apple-ios16.0 \
             -sdk $SDK_PATH \
@@ -24,7 +24,7 @@ jobs:
             -O \
             -o main.o
 
-          # 2. Линкуем под iOS 16.0 и подключаем AppIntents
+          # 2. Линкуем объектный файл с необходимыми фреймворками
           clang -isysroot $SDK_PATH \
             -target arm64-apple-ios16.0 \
             -fobjc-link-runtime \
@@ -35,6 +35,7 @@ jobs:
             -framework UIKit \
             -framework SwiftUI \
             -framework AppIntents \
+            -framework Network \
             main.o -o LupinSuite
 
       - name: Сборка структуры .app и Info.plist
