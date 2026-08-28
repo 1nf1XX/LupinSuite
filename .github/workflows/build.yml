@@ -1,0 +1,11 @@
+name: Build Swift App
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Swift File
+        run: swiftc main.swift -o LupinApp
