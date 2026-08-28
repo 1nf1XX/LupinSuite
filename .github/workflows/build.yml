@@ -16,16 +16,25 @@ jobs:
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          # Компиляция c полной явной линковкой нужных iOS-фреймворков
-          swiftc main.swift -o LupinSuite \
+          # 1. Сначала компилируем main.swift в объектный файл
+          swiftc -c main.swift \
             -target arm64-apple-ios15.0 \
             -sdk $SDK_PATH \
             -parse-as-library \
-            -emit-executable \
+            -O \
+            -o main.o
+
+          # 2. Линкуем с ключом swift-5.5+ runtime и системными биндингами
+          clang -isysroot $SDK_PATH \
+            -target arm64-apple-ios15.0 \
+            -fobjc-link-runtime \
+            -L/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphoneos \
+            -Xlinker -rpath -Xlinker /System/Library/Frameworks \
+            -Xlinker -rpath -Xlinker /usr/lib/swift \
             -framework Foundation \
             -framework UIKit \
             -framework SwiftUI \
-            -O
+            main.o -o LupinSuite
 
       - name: Сборка структуры .app и Info.plist
         run: |
