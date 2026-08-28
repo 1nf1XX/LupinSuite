@@ -1,4 +1,4 @@
-name: Build Swift App
+name: Build LupinApp with Icon
 
 on: [push]
 
@@ -10,11 +10,58 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Compile Swift File
-        run: swiftc main.swift -o LupinApp
+      - name: Prepare App Bundle & Compile
+        run: |
+          # 1. Создаем структуру .app бандла
+          mkdir -p LupinApp.app/Contents/MacOS
+          mkdir -p LupinApp.app/Contents/Resources
+          
+          # 2. Компилируем твой файл в исполняемый бинарник
+          swiftc -target x86_64-apple-macos13 -framework SwiftUI -framework AppKit main.swift -o LupinApp.app/Contents/MacOS/LupinApp
+          
+          # 3. Создаем Info.plist для приложения
+          cat << 'EOF' > LupinApp.app/Contents/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>LupinApp</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.lupin.suite</string>
+              <key>CFBundleName</key>
+              <string>LupinApp</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>3.0</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon</string>
+          </dict>
+          </plist>
+          EOF
+
+          # 4. Если в корне репозитория лежит картинка AppIcon.png, конвертируем её в icns и добавляем
+          if [ -f "AppIcon.png" ]; then
+            mkdir icon.iconset
+            sips -z 16 16     AppIcon.png --out icon.iconset/icon_16x16.png
+            sips -z 32 32     AppIcon.png --out icon.iconset/icon_16x16@2x.png
+            sips -z 32 32     AppIcon.png --out icon.iconset/icon_32x32.png
+            sips -z 64 64     AppIcon.png --out icon.iconset/icon_32x32@2x.png
+            sips -z 128 128   AppIcon.png --out icon.iconset/icon_128x128.png
+            sips -z 256 256   AppIcon.png --out icon.iconset/icon_128x128@2x.png
+            sips -z 256 256   AppIcon.png --out icon.iconset/icon_256x256.png
+            sips -z 512 512   AppIcon.png --out icon.iconset/icon_256x256@2x.png
+            sips -z 512 512   AppIcon.png --out icon.iconset/icon_512x512.png
+            sips -z 1024 1024 AppIcon.png --out icon.iconset/icon_512x512@2x.png
+            iconutil -c icns icon.iconset -o LupinApp.app/Contents/Resources/AppIcon.icns
+          fi
+
+          # 5. Упаковываем в zip для удобного скачивания
+          zip -r LupinApp.zip LupinApp.app
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LupinApp
-          path: LupinApp
+          name: LupinApp-Bundle
+          path: LupinApp.zip
