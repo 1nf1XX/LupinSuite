@@ -16,16 +16,16 @@ jobs:
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          # Компилируем Swift код с поддержкой SwiftUI/UIKit фреймворков
+          # Компиляция c полной явной линковкой нужных iOS-фреймворков
           swiftc main.swift -o LupinSuite \
             -target arm64-apple-ios15.0 \
             -sdk $SDK_PATH \
             -parse-as-library \
-            -Xlinker -rpath -Xlinker /System/Library/Frameworks \
-            -O || {
-              echo "Попытка прямой компиляции без parse-as-library..."
-              swiftc main.swift -o LupinSuite -target arm64-apple-ios15.0 -sdk $SDK_PATH -O
-            }
+            -emit-executable \
+            -framework Foundation \
+            -framework UIKit \
+            -framework SwiftUI \
+            -O
 
       - name: Сборка структуры .app и Info.plist
         run: |
@@ -36,7 +36,7 @@ jobs:
             cp AppIcon.png Payload/LupinSuite.app/
           fi
           
-          cat <<EOF > Payload/LupinSuite.app/Info.plist
+          cat <<'EOF' > Payload/LupinSuite.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
