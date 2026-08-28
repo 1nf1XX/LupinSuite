@@ -16,17 +16,17 @@ jobs:
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          # 1. Компилируем main.swift в объектный файл с поддержкой iOS 16.0
+          # 1. Компилируем под iOS 17.0
           swiftc -c main.swift \
-            -target arm64-apple-ios16.0 \
+            -target arm64-apple-ios17.0 \
             -sdk $SDK_PATH \
             -parse-as-library \
             -O \
             -o main.o
 
-          # 2. Линкуем объектный файл с необходимыми фреймворками
+          # 2. Линкуем под iOS 17.0 и добавляем EventKit
           clang -isysroot $SDK_PATH \
-            -target arm64-apple-ios16.0 \
+            -target arm64-apple-ios17.0 \
             -fobjc-link-runtime \
             -L/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphoneos \
             -Xlinker -rpath -Xlinker /System/Library/Frameworks \
@@ -36,6 +36,7 @@ jobs:
             -framework SwiftUI \
             -framework AppIntents \
             -framework Network \
+            -framework EventKit \
             main.o -o LupinSuite
 
       - name: Сборка структуры .app и Info.plist
@@ -69,7 +70,7 @@ jobs:
               <key>LSRequiresIPhoneOS</key>
               <true/>
               <key>MinimumOSVersion</key>
-              <string>16.0</string>
+              <string>17.0</string>
               <key>UILaunchScreen</key>
               <dict/>
           </dict>
