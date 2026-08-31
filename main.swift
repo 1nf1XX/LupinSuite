@@ -8,7 +8,6 @@ import UserNotifications
 import Foundation
 import Combine
 import AppIntents
-import EventKit
 
 // MARK: - Telegram Bot Connection
 class TelegramBotConnection: ObservableObject {
@@ -206,8 +205,6 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @Published var botConnection: TelegramBotConnection?
     
     private var chatHistory: [[String: String]] = []
-    /// Ссылка на текущий сетевой запрос к DeepSeek — нужна, чтобы кнопка "стоп" могла его оборвать.
-    private var currentTask: URLSessionDataTask?
     
     override init() {
         super.init()
@@ -305,10 +302,8 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
         DispatchQueue.main.async { self.isProcessing = true }
 
-        currentTask = URLSession.shared.dataTask(with: request) { data, response, error in
+        URLSession.shared.dataTask(with: request) { data, response, error in
             DispatchQueue.main.async { self.isProcessing = false }
-
-            if (error as NSError?)?.code == NSURLErrorCancelled { return }
 
             if let httpResponse = response as? HTTPURLResponse, !(200...299).contains(httpResponse.statusCode) {
                 DispatchQueue.main.async {
@@ -339,40 +334,7 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                     self.assistantReply = "Ошибка парсинга ответа API."
                 }
             }
-        }
-        currentTask?.resume()
-    }
-
-    // MARK: - Стоп
-    /// Немедленно обрывает озвучку (кнопка "стоп" — когда LUPIN уже мешает) и, если запрос
-    /// к DeepSeek ещё летит, отменяет и его — незачем дальше ждать ответ, который уже не нужен.
-    func stopSpeaking() {
-        synthesizer.stopSpeaking(at: .immediate)
-        currentTask?.cancel()
-        isSpeaking = false
-        isProcessing = false
-    }
-
-    // MARK: - Обсуждение события календаря
-    /// Вызывается либо по кнопке "Обсудить" у события, либо когда пользователь открыл приложение
-    /// по тапу на уведомление о встрече. Формирует контекст события одним сообщением и сразу
-    /// уходит в обычный DeepSeek-пайплайн — дальше пользователь продолжает диалог как обычно,
-    /// история чата (chatHistory) уже содержит контекст встречи.
-    func discussEvent(_ event: CalendarManager.EventInfo) {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm"
-        let timeString = formatter.string(from: event.startDate)
-
-        var context = "У пользователя скоро событие в календаре: «\(event.title)» в \(timeString)."
-        if let location = event.location, !location.isEmpty {
-            context += " Место: \(location)."
-        }
-        if let notes = event.notes, !notes.isEmpty {
-            context += " Заметки: \(notes)."
-        }
-        context += " Кратко напомни об этом голосом и спроси, нужна ли помощь с подготовкой."
-
-        sendToDeepSeek(prompt: context)
+        }.resume()
     }
 
     // MARK: - Голосовой ввод
@@ -591,7 +553,6 @@ struct ContentView: View {
     @StateObject var assistant = VoiceAssistant()
     @StateObject var botConnection = TelegramBotConnection()
     @StateObject var historyStore = CommandHistoryStore()
-    @StateObject var calendarManager = CalendarManager()
     @State private var showPCControls = false
     @State private var showSettings = false
     @State private var showHistory = false
@@ -725,77 +686,27 @@ struct ContentView: View {
                     .frame(maxHeight: 80)
                 }
                 .padding(.horizontal)
-
-                if calendarManager.accessGranted && !calendarManager.upcomingEvents.isEmpty {
-                    SectionView(title: "БЛИЖАЙШИЕ СОБЫТИЯ") {
-                        VStack(spacing: 6) {
-                            ForEach(calendarManager.upcomingEvents.prefix(3)) { event in
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(event.title)
-                                            .font(.system(size: 13, design: .monospaced))
-                                            .foregroundColor(.white)
-                                            .lineLimit(1)
-                                        Text(Self.eventTimeFormatter.string(from: event.startDate))
-                                            .font(.system(size: 11, design: .monospaced))
-                                            .foregroundColor(.lupinTextDim)
-                                    }
-                                    Spacer()
-                                    Button("ОБСУДИТЬ") {
-                                        historyStore.log("обсудить: \(event.title)", source: "calendar")
-                                        assistant.discussEvent(event)
-                                    }
-                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                    .foregroundColor(.black)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 6)
-                                    .background(Color.lupinAccent)
-                                    .cornerRadius(4)
-                                }
-                            }
-                        }
-                    }
-                    .padding(.horizontal)
-                }
                 
                 Spacer()
-
-                HStack(spacing: 18) {
-                    Button(action: {
-                        if assistant.isListening {
-                            assistant.stopListening()
-                            // Отправляем голос в ИИ
-                            historyStore.log(assistant.recognizedText, source: "voice")
-                            assistant.sendToDeepSeek(prompt: assistant.recognizedText)
-                        } else {
-                            assistant.startListening()
-                        }
-                    }) {
-                        Image(systemName: assistant.isListening ? "mic.fill" : "mic.slash.fill")
-                            .font(.system(size: 35))
-                            .foregroundColor(.black)
-                            .padding(25)
-                            .background(assistant.isListening ? Color.lupinRed : Color.lupinAccent)
-                            .clipShape(Circle())
-                            .shadow(color: (assistant.isListening ? Color.lupinRed : Color.lupinAccent).opacity(0.5), radius: 10)
+                
+                Button(action: {
+                    if assistant.isListening {
+                        assistant.stopListening()
+                        // Отправляем голос в ИИ
+                        historyStore.log(assistant.recognizedText, source: "voice")
+                        assistant.sendToDeepSeek(prompt: assistant.recognizedText)
+                    } else {
+                        assistant.startListening()
                     }
-
-                    // Кнопка "стоп" — видна, только пока LUPIN говорит или думает, чтобы не
-                    // занимать место на экране без надобности.
-                    if assistant.isSpeaking || assistant.isProcessing {
-                        Button(action: { assistant.stopSpeaking() }) {
-                            Image(systemName: "stop.fill")
-                                .font(.system(size: 22))
-                                .foregroundColor(.black)
-                                .padding(16)
-                                .background(Color.lupinOrange)
-                                .clipShape(Circle())
-                                .shadow(color: Color.lupinOrange.opacity(0.5), radius: 8)
-                        }
-                        .transition(.scale.combined(with: .opacity))
-                    }
+                }) {
+                    Image(systemName: assistant.isListening ? "mic.fill" : "mic.slash.fill")
+                        .font(.system(size: 35))
+                        .foregroundColor(.black)
+                        .padding(25)
+                        .background(assistant.isListening ? Color.lupinRed : Color.lupinAccent)
+                        .clipShape(Circle())
+                        .shadow(color: (assistant.isListening ? Color.lupinRed : Color.lupinAccent).opacity(0.5), radius: 10)
                 }
-                .animation(.easeInOut(duration: 0.2), value: assistant.isSpeaking || assistant.isProcessing)
                 
                 Text(assistant.isListening ? "ИДЕТ ЗАПИСЬ..." : "НАЖМИ ДЛЯ ВВОДА")
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
@@ -819,24 +730,11 @@ struct ContentView: View {
             assistant.botConnection = botConnection
             botConnection.historyStore = historyStore
             NotificationManager.shared.requestAuthorization()
-            calendarManager.requestAccess()
             if assistant.apiKey.isEmpty {
                 showSettings = true
             }
         }
-        // Тап по уведомлению о встрече — сразу просим LUPIN обсудить именно это событие.
-        .onReceive(NotificationCenter.default.publisher(for: .lupinDiscussEvent)) { notification in
-            guard let eventId = notification.userInfo?["eventId"] as? String,
-                  let event = calendarManager.event(withId: eventId) else { return }
-            assistant.discussEvent(event)
-        }
     }
-
-    private static let eventTimeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "dd.MM HH:mm"
-        return f
-    }()
     
     private func sendTextCommand() {
         guard !textInput.isEmpty else { return }
@@ -1583,32 +1481,6 @@ final class NotificationManager: NSObject, ObservableObject {
     func cancelAllReminders() {
         UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
     }
-
-    /// Уведомление о событии календаря — в отличие от scheduleReminder несёт eventId в userInfo,
-    /// чтобы при тапе LUPIN понимал, какую именно встречу пользователь хочет обсудить.
-    @discardableResult
-    func scheduleCalendarEvent(id: String, title: String, body: String, fireDate: Date, eventId: String) -> Bool {
-        guard permissionGranted else { return false }
-        let interval = fireDate.timeIntervalSinceNow
-        guard interval > 0 else { return false }
-
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = .default
-        content.userInfo = ["lupinEventId": eventId]
-
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false)
-        let request = UNNotificationRequest(identifier: id, content: content, trigger: trigger)
-        UNUserNotificationCenter.current().add(request)
-        return true
-    }
-}
-
-extension Notification.Name {
-    /// Летит, когда пользователь тапнул по уведомлению о встрече — ContentView слушает
-    /// это и сразу открывает обсуждение нужного события с LUPIN.
-    static let lupinDiscussEvent = Notification.Name("lupinDiscussEvent")
 }
 
 // MARK: - Foreground presentation
@@ -1619,93 +1491,11 @@ extension NotificationManager: UNUserNotificationCenterDelegate {
                                  withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner, .sound, .badge])
     }
-
-    // Тап по уведомлению о календарном событии — сообщаем об этом остальному приложению.
-    func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                 didReceive response: UNNotificationResponse,
-                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        if let eventId = response.notification.request.content.userInfo["lupinEventId"] as? String {
-            NotificationCenter.default.post(name: .lupinDiscussEvent, object: nil, userInfo: ["eventId": eventId])
-        }
-        completionHandler()
-    }
-}
-
-// MARK: - Calendar Manager
-/// Читает системный календарь через EventKit, следит за ближайшими 48 часами и заранее
-/// планирует локальные уведомления о встречах. Само содержание разговора об этих событиях
-/// LUPIN ведёт уже через VoiceAssistant.discussEvent(_:).
-final class CalendarManager: NSObject, ObservableObject {
-    private let store = EKEventStore()
-
-    @Published var accessGranted = false
-    @Published var upcomingEvents: [EventInfo] = []
-
-    /// За сколько минут до начала события присылать напоминание.
-    var leadTimeMinutes: Double = 15
-
-    struct EventInfo: Identifiable, Equatable {
-        let id: String // eventIdentifier
-        let title: String
-        let startDate: Date
-        let location: String?
-        let notes: String?
-    }
-
-    func requestAccess() {
-        store.requestFullAccessToEvents { [weak self] granted, _ in
-            DispatchQueue.main.async {
-                self?.accessGranted = granted
-                if granted {
-                    self?.refresh()
-                }
-            }
-        }
-    }
-
-    /// Перечитывает ближайшие события и (пере)планирует уведомления по ним.
-    func refresh() {
-        guard accessGranted else { return }
-
-        let calendars = store.calendars(for: .event)
-        let start = Date()
-        let end = Calendar.current.date(byAdding: .hour, value: 48, to: start) ?? start
-        let predicate = store.predicateForEvents(withStart: start, end: end, calendars: calendars)
-
-        let infos = store.events(matching: predicate)
-            .sorted { $0.startDate < $1.startDate }
-            .map {
-                EventInfo(id: $0.eventIdentifier, title: $0.title ?? "Без названия",
-                          startDate: $0.startDate, location: $0.location, notes: $0.notes)
-            }
-
-        DispatchQueue.main.async { self.upcomingEvents = infos }
-        infos.forEach(scheduleReminder)
-    }
-
-    private func scheduleReminder(for event: EventInfo) {
-        let fireDate = event.startDate.addingTimeInterval(-leadTimeMinutes * 60)
-        guard fireDate > Date() else { return }
-
-        NotificationManager.shared.scheduleCalendarEvent(
-            id: "lupin_event_\(event.id)",
-            title: "LUPIN // через \(Int(leadTimeMinutes)) мин",
-            body: event.title,
-            fireDate: fireDate,
-            eventId: event.id
-        )
-    }
-
-    func event(withId id: String) -> EventInfo? {
-        upcomingEvents.first { $0.id == id }
-    }
 }
 
 // ======================================================================
 
 // ВАЖНО (требования для реальной сборки):
-// 0. В Info.plist нужно добавить ключ NSCalendarsFullAccessUsageDescription (текст объяснения,
-//    зачем LUPIN нужен доступ к календарю) — без него requestFullAccessToEvents уронит приложение.
 // 1. Таргет должен поддерживать iOS 16+ (App Intents framework).
 // 2. Bot Token/Chat ID сейчас захардкожены в TelegramBotConnection — App Intents создают
 //    СВОЙ экземпляр соединения (см. IntentBotBridge ниже), а не переиспользуют тот,
