@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Чекаут кода
         uses: actions/checkout@v4
-
+        
       - name: Компиляция Swift-файла
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
