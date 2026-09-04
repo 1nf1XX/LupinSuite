@@ -1,5 +1,6 @@
-// LUPIN — единый файл (main app, история команд, макросы, локальные уведомления, Siri Shortcuts / App Intents)
-// v2.1 — исправлены: IntentDialog в App Intents, конфликт mic/озвучка, NLU-фильтр по словам, polling foreground/background, общий LupinConfig
+// LUPIN — единый файл (main app, история команд, макросы, локальные уведомления, Siri Shortcuts / App Intents, Long-Term Memory, Full-Duplex Interrupts)
+// v3.0 — Добавлены: Бесконечная долгосрочная память (MemoryStore) + Мгновенное перебивание без платных API (Full-Duplex VAD)
+
 import SwiftUI
 import AVFoundation
 import Speech
@@ -8,6 +9,53 @@ import UserNotifications
 import Foundation
 import Combine
 import AppIntents
+
+// MARK: - Long-Term Memory Store (Локальная долгосрочная память)
+final class MemoryStore: ObservableObject {
+    @Published private(set) var memories: [String] = []
+    private let fileURL: URL
+
+    init() {
+        let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+        fileURL = paths[0].appendingPathComponent("lupin_memory.json")
+        load()
+    }
+
+    func remember(_ fact: String) {
+        let trimmed = fact.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !memories.contains(trimmed) else { return }
+        memories.append(trimmed)
+        save()
+    }
+
+    func forget(_ query: String? = nil) {
+        if let query = query, !query.isEmpty {
+            let lower = query.lowercased()
+            memories.removeAll { $0.lowercased().contains(lower) }
+        } else {
+            memories.removeAll()
+        }
+        save()
+    }
+
+    func getFormattedMemoryContext() -> String {
+        guard !memories.isEmpty else { return "Долгосрочная память пуста." }
+        return "СОХРАНЕННЫЕ ФАКТЫ О ПОЛЬЗОВАТЕЛЕ И КОНТЕКСТЕ:\n" + memories.map { "- \($0)" }.joined(separator: "\n")
+    }
+
+    private func save() {
+        if let data = try? JSONEncoder().encode(memories) {
+            try? data.write(to: fileURL)
+        }
+    }
+
+    private func load() {
+        if let data = try? Data(contentsOf: fileURL),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            memories = decoded
+        }
+    }
+}
 
 // MARK: - Telegram Bot Connection
 class TelegramBotConnection: ObservableObject {
@@ -21,15 +69,10 @@ class TelegramBotConnection: ObservableObject {
     private var pollingTimer: Timer?
     private var isPolling = false
 
-    /// Слабая ссылка на историю команд — так все кнопки (PC Control, макросы и т.д.)
-    /// логируются в одном месте без переписывания каждого вызова.
     weak var historyStore: CommandHistoryStore?
     
     init() {
         startPolling()
-        // iOS всё равно замораживает Timer в фоне через пару минут — вместо того чтобы
-        // впустую крутить его там, останавливаем на уход в фон и сразу опрашиваем при
-        // возврате в приложение, чтобы ответ подтянулся без задержки в 2 секунды.
         NotificationCenter.default.addObserver(self, selector: #selector(appDidEnterBackground),
                                                  name: UIApplication.didEnterBackgroundNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(appWillEnterForeground),
@@ -40,16 +83,9 @@ class TelegramBotConnection: ObservableObject {
         NotificationCenter.default.removeObserver(self)
     }
 
-    @objc private func appDidEnterBackground() {
-        stopPolling()
-    }
-
-    @objc private func appWillEnterForeground() {
-        checkUpdates()
-        startPolling()
-    }
+    @objc private func appDidEnterBackground() { stopPolling() }
+    @objc private func appWillEnterForeground() { checkUpdates(); startPolling() }
     
-    // MARK: - Отправка команды
     func sendCommand(_ text: String, completion: ((Bool, String) -> Void)? = nil) {
         let urlString = "https://api.telegram.org/bot\(botToken)/sendMessage"
         guard let url = URL(string: urlString) else { return }
@@ -58,14 +94,8 @@ class TelegramBotConnection: ObservableObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
-        let body: [String: Any] = [
-            "chat_id": chatId,
-            "text": text
-        ]
-        
+        let body: [String: Any] = ["chat_id": chatId, "text": text]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        
-        print("📤 Sending: \(text)")
         
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
@@ -74,7 +104,6 @@ class TelegramBotConnection: ObservableObject {
                     completion?(false, self?.lastResponse ?? "")
                     return
                 }
-                
                 if let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let ok = json["ok"] as? Bool, ok {
@@ -88,11 +117,9 @@ class TelegramBotConnection: ObservableObject {
         }.resume()
     }
     
-    // MARK: - Polling ответов
     func startPolling() {
         guard !isPolling else { return }
         isPolling = true
-        
         pollingTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.checkUpdates()
         }
@@ -112,22 +139,16 @@ class TelegramBotConnection: ObservableObject {
             guard let self = self,
                   let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let result = json["result"] as? [[String: Any]] else {
-                return
-            }
+                  let result = json["result"] as? [[String: Any]] else { return }
             
             for update in result {
                 if let updateId = update["update_id"] as? Int64 {
                     self.lastUpdateId = updateId
                 }
-                
                 if let message = update["message"] as? [String: Any],
                    let text = message["text"] as? String {
                     DispatchQueue.main.async {
-                        print("📥 Bot reply: \(text)")
                         self.botReply = text
-                        // Локальное уведомление — сработает, пока приложение живо в фоне
-                        // (не настоящий push, см. заметку в NotificationManager.swift)
                         NotificationManager.shared.notifyNow(title: "LUPIN", body: text)
                     }
                 }
@@ -135,27 +156,21 @@ class TelegramBotConnection: ObservableObject {
         }.resume()
     }
     
-    // MARK: - Все команды
     func sendVoiceCommand(_ text: String) { sendCommand(text) }
     func sendTextMessage(_ text: String) { sendCommand(text) }
     func requestSystemInfo() { sendCommand("инфо") }
     func getProcessList() { sendCommand("процессы") }
-    
     func controlMedia(_ action: String) {
         let commands = ["prev": "предыдущий трек", "toggle": "пауза", "next": "следующий трек"]
         if let cmd = commands[action] { sendCommand(cmd) }
     }
-    
     func searchMusic(_ query: String) { sendCommand("включи \(query)") }
-    
     func controlTor(_ action: String) {
         let commands = ["connect": "включи тор", "disconnect": "выключи тор"]
         if let cmd = commands[action] { sendCommand(cmd) }
     }
-    
     func takeScreenshot() { sendCommand("скриншот") }
     func controlVolume(_ volume: Int) { sendCommand("громкость \(volume)") }
-    
     func launchApp(_ app: String) {
         let commands = [
             "chrome": "открой хром", "notepad": "открой блокнот",
@@ -164,7 +179,6 @@ class TelegramBotConnection: ObservableObject {
         ]
         if let cmd = commands[app] { sendCommand(cmd) }
     }
-    
     func powerControl(_ action: String) {
         let commands = [
             "lock": "заблокируй пк", "sleep": "спящий режим",
@@ -172,12 +186,10 @@ class TelegramBotConnection: ObservableObject {
         ]
         if let cmd = commands[action] { sendCommand(cmd) }
     }
-    
     func switchAudioDevice(_ device: String) {
         let commands = ["speaker": "на колонку", "headphones": "на наушники"]
         if let cmd = commands[device] { sendCommand(cmd) }
     }
-    
     func getWifiPasswords() { sendCommand("wifi пароли") }
     func generatePassword() { sendCommand("пароль") }
     func getIP() { sendCommand("ip адрес") }
@@ -186,7 +198,7 @@ class TelegramBotConnection: ObservableObject {
     func speakOnPC(_ text: String) { sendCommand("скажи \(text)") }
 }
 
-// MARK: - Voice Assistant с DeepSeek ИИ
+// MARK: - Voice Assistant & Interrupt Handling
 class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var synthesizer = AVSpeechSynthesizer()
     private var speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ru-RU"))
@@ -204,15 +216,12 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @AppStorage("deepseek_api_key") var apiKey: String = ""
     @Published var botConnection: TelegramBotConnection?
     
+    var memoryStore = MemoryStore()
     private var chatHistory: [[String: String]] = []
     
     override init() {
         super.init()
         synthesizer.delegate = self
-        chatHistory.append([
-            "role": "system",
-            "content": "Тебя зовут LUPIN — ИИ-ассистент. Стиль общения: сдержанный, точный, слегка ироничный, как у безупречного личного помощника. Отвечай по делу, кратко, без грубости. Лёгкий налёт элегантности и остроумия уместен, хамство — нет."
-        ])
     }
 
     private func pickVoice() -> AVSpeechSynthesisVoice? {
@@ -226,7 +235,7 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private func configurePlaybackSession() {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
             print("Audio session error: \(error)")
@@ -240,6 +249,9 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         utterance.rate = 0.46
         utterance.pitchMultiplier = 0.78
         utterance.postUtteranceDelay = 0.05
+        
+        // Начинаем мониторинг голоса для перебивания
+        startInterruptMonitoring()
         synthesizer.speak(utterance)
     }
 
@@ -248,16 +260,85 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        DispatchQueue.main.async { self.isSpeaking = false }
+        DispatchQueue.main.async {
+            self.isSpeaking = false
+            self.stopInterruptMonitoring()
+        }
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        DispatchQueue.main.async { self.isSpeaking = false }
+        DispatchQueue.main.async {
+            self.isSpeaking = false
+            self.stopInterruptMonitoring()
+        }
     }
 
-    // MARK: - Отправка в DeepSeek
+    // MARK: - Interrupt (VAD) Logic без платных API
+    private func startInterruptMonitoring() {
+        let inputNode = audioEngine.inputNode
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        
+        inputNode.removeTap(onBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+            guard let self = self, self.isSpeaking else { return }
+            
+            // Расчет уровня громкости (RMS)
+            guard let channelData = buffer.floatChannelData?[0] else { return }
+            let frames = Double(buffer.frameLength)
+            var sum: Double = 0
+            for i in 0..<Int(buffer.frameLength) {
+                sum += Double(channelData[i] * channelData[i])
+            }
+            let rms = sqrt(sum / frames)
+            
+            // Если пользователь заговорил громче порога — перебиваем синтезатор!
+            if rms > 0.08 {
+                DispatchQueue.main.async {
+                    print("🛑 INTERRUPT DETECTED! Stopping speech...")
+                    self.synthesizer.stopSpeaking(at: .immediate)
+                    self.stopInterruptMonitoring()
+                    self.startListening()
+                }
+            }
+        }
+        
+        audioEngine.prepare()
+        try? audioEngine.start()
+    }
+
+    private func stopInterruptMonitoring() {
+        if !isListening {
+            audioEngine.stop()
+            audioEngine.inputNode.removeTap(onBus: 0)
+        }
+    }
+
+    // MARK: - Отправка в DeepSeek + Память
     func sendToDeepSeek(prompt: String, sendToPC: Bool = false) {
-        // Если нужно отправить на ПК
+        let lower = prompt.lowercased()
+        
+        // Команды работы с долгосрочной памятью
+        if lower.contains("забудь всё") || lower.contains("забудь все") {
+            memoryStore.forget()
+            assistantReply = "Долгосрочная память полностью очищена."
+            speak(assistantReply)
+            return
+        } else if lower.hasPrefix("забудь про") || lower.hasPrefix("забудь ") {
+            let target = lower.replacingOccurrences(of: "забудь про", with: "").replacingOccurrences(of: "забудь", with: "").trimmingCharacters(in: .whitespaces)
+            memoryStore.forget(target)
+            assistantReply = "Удалены воспоминания, содержащие: '\(target)'."
+            speak(assistantReply)
+            return
+        } else if lower.hasPrefix("запомни") {
+            let fact = prompt.replacingOccurrences(of: "Запомни", with: "", options: .caseInsensitive).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !fact.isEmpty {
+                memoryStore.remember(fact)
+                assistantReply = "Запомнил: '\(fact)'."
+                speak(assistantReply)
+                return
+            }
+        }
+
         if sendToPC, let bot = botConnection {
             bot.sendVoiceCommand(prompt)
             DispatchQueue.main.async {
@@ -267,7 +348,6 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             return
         }
         
-        // Иначе — DeepSeek
         guard !apiKey.isEmpty else {
             DispatchQueue.main.async {
                 self.assistantReply = "Ключ DeepSeek не задан. Открой настройки."
@@ -277,24 +357,27 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         }
         
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-
         guard let url = URL(string: "https://api.deepseek.com/chat/completions") else { return }
+
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        // Добавляем сообщение в историю
-        chatHistory.append(["role": "user", "content": prompt])
+        // Формирование системного промпта с долгосрочной памятью
+        let systemPrompt = """
+        Тебя зовут LUPIN — ИИ-ассистент. Стиль общения: сдержанный, точный, слегка ироничный, как у безупречного личного помощника.
         
-        // Ограничиваем историю
-        if chatHistory.count > 11 {
-            chatHistory = [chatHistory[0]] + chatHistory.suffix(10)
-        }
+        \(memoryStore.getFormattedMemoryContext())
+        """
+
+        var currentMessages: [[String: String]] = [["role": "system", "content": systemPrompt]]
+        currentMessages.append(contentsOf: chatHistory.suffix(10))
+        currentMessages.append(["role": "user", "content": prompt])
 
         let requestBody: [String: Any] = [
             "model": "deepseek-chat",
-            "messages": chatHistory,
+            "messages": currentMessages,
             "stream": false
         ]
 
@@ -326,6 +409,7 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
                 DispatchQueue.main.async {
                     self.assistantReply = content
+                    self.chatHistory.append(["role": "user", "content": prompt])
                     self.chatHistory.append(["role": "assistant", "content": content])
                     self.speak(content)
                 }
@@ -354,13 +438,12 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
     func stopListening() {
         audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
         recognitionRequest?.endAudio()
         isListening = false
     }
 
     private func startRecording() {
-        // Останавливаем озвучку, если ассистент ещё говорит — иначе микрофон
-        // запишет собственную речь синтезатора вместо голоса пользователя.
         synthesizer.stopSpeaking(at: .immediate)
 
         if recognitionTask != nil {
@@ -377,6 +460,8 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         recognitionRequest.shouldReportPartialResults = true
 
         let inputNode = audioEngine.inputNode
+        inputNode.removeTap(onBus: 0)
+        
         recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { result, error in
             var isFinal = false
             if let result = result {
@@ -557,6 +642,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showHistory = false
     @State private var showMacros = false
+    @State private var showMemoryView = false
     @State private var textInput = ""
     @State private var showTextInput = false
     
@@ -573,6 +659,12 @@ struct ContentView: View {
                     Spacer()
 
                     HStack(spacing: 16) {
+                        Button(action: { showMemoryView = true }) {
+                            Image(systemName: "brain.head.profile")
+                                .font(.system(size: 16))
+                                .foregroundColor(.lupinTextDim)
+                        }
+
                         Button(action: { showMacros = true }) {
                             Image(systemName: "bolt.fill")
                                 .font(.system(size: 16))
@@ -692,7 +784,6 @@ struct ContentView: View {
                 Button(action: {
                     if assistant.isListening {
                         assistant.stopListening()
-                        // Отправляем голос в ИИ
                         historyStore.log(assistant.recognizedText, source: "voice")
                         assistant.sendToDeepSeek(prompt: assistant.recognizedText)
                     } else {
@@ -726,6 +817,9 @@ struct ContentView: View {
         .sheet(isPresented: $showMacros) {
             MacrosView(botConnection: botConnection, historyStore: historyStore)
         }
+        .sheet(isPresented: $showMemoryView) {
+            MemoryInspectorView(memoryStore: assistant.memoryStore)
+        }
         .onAppear {
             assistant.botConnection = botConnection
             botConnection.historyStore = historyStore
@@ -741,10 +835,6 @@ struct ContentView: View {
         let text = textInput
         textInput = ""
         
-        // Проверяем: это команда для ПК или вопрос для ИИ?
-        // Проверка по целым словам (а не по вхождению подстроки), чтобы "выключи" не находилось
-        // внутри случайного текста типа "как выключить автозапуск" — плюс явный вопросительный
-        // оборот в начале фразы всегда уходит в DeepSeek, даже если внутри есть ключевое слово.
         let pcCommandPrefixes = ["открой", "пауза", "следующ", "предыдущ", "громкость", "выключи", "перезагрузи", "заблокируй", "скриншот", "инфо", "процессы", "wifi", "пароль", "ip", "корзин", "буфер", "скажи", "включи"]
         let questionStarters = ["как", "что", "почему", "зачем", "можно", "подскажи", "объясни", "расскажи"]
 
@@ -763,6 +853,73 @@ struct ContentView: View {
         } else {
             assistant.sendToDeepSeek(prompt: text)
         }
+    }
+}
+
+// MARK: - Memory Inspector View (Просмотр и ручное удаление из долгосрочной памяти)
+struct MemoryInspectorView: View {
+    @ObservedObject var memoryStore: MemoryStore
+    @Environment(\.dismiss) var dismiss
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                Color.lupinBackground.ignoresSafeArea()
+
+                if memoryStore.memories.isEmpty {
+                    VStack(spacing: 10) {
+                        Image(systemName: "brain.head.profile")
+                            .font(.system(size: 32))
+                            .foregroundColor(.lupinTextDim)
+                        Text("ПАМЯТЬ ПУСТА")
+                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                            .foregroundColor(.lupinTextDim)
+                    }
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 8) {
+                            ForEach(memoryStore.memories, id: \.self) { fact in
+                                HStack {
+                                    Text("• \(fact)")
+                                        .font(.system(size: 13, design: .monospaced))
+                                        .foregroundColor(.white)
+                                    Spacer()
+                                    Button(role: .destructive) {
+                                        memoryStore.forget(fact)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .foregroundColor(.lupinRed)
+                                    }
+                                }
+                                .padding(10)
+                                .background(Color.lupinPanel)
+                                .cornerRadius(4)
+                                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.lupinBorder, lineWidth: 1))
+                            }
+                        }
+                        .padding()
+                    }
+                }
+            }
+            .navigationTitle("ДОЛГОСРОЧНАЯ ПАМЯТЬ")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button(role: .destructive) {
+                        memoryStore.forget()
+                    } label: {
+                        Image(systemName: "trash")
+                            .foregroundColor(.lupinRed)
+                    }
+                    .disabled(memoryStore.memories.isEmpty)
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("ЗАКРЫТЬ") { dismiss() }
+                        .foregroundColor(.lupinAccent)
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 }
 
@@ -991,14 +1148,12 @@ struct LupinApp: App {
     }
 }
 
-// ======================================================================
-
 // MARK: - Command Log Entry
 struct CommandLogEntry: Identifiable, Codable, Equatable {
     let id: UUID
     let text: String
     let timestamp: Date
-    let source: String // "voice" | "text" | "macro" | "button"
+    let source: String
 
     init(text: String, source: String) {
         self.id = UUID()
@@ -1009,17 +1164,12 @@ struct CommandLogEntry: Identifiable, Codable, Equatable {
 }
 
 // MARK: - History Store
-/// Локальная история команд, отправленных на ПК.
-/// Аналог lupin_commands.log на стороне Python, только на телефоне и без доступа к чату Telegram.
 final class CommandHistoryStore: ObservableObject {
     @Published private(set) var entries: [CommandLogEntry] = []
-
     private let storageKey = "lupin_command_history_v1"
     private let maxEntries = 300
 
-    init() {
-        load()
-    }
+    init() { load() }
 
     func log(_ text: String, source: String) {
         let entry = CommandLogEntry(text: text, source: source)
@@ -1043,14 +1193,10 @@ final class CommandHistoryStore: ObservableObject {
 
     private func load() {
         guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode([CommandLogEntry].self, from: data) else {
-            return
-        }
+              let decoded = try? JSONDecoder().decode([CommandLogEntry].self, from: data) else { return }
         entries = decoded
     }
 }
-
-// ======================================================================
 
 struct CommandHistoryView: View {
     @ObservedObject var historyStore: CommandHistoryStore
@@ -1136,15 +1282,11 @@ struct CommandHistoryView: View {
     }
 }
 
-// ======================================================================
-
 // MARK: - Macro Model
 struct Macro: Identifiable, Codable, Equatable {
     let id: UUID
     var name: String
-    var steps: [String] // текстовые команды, отправляются по очереди, как в sendCommand
-    /// Пауза между шагами в секундах — некоторым командам на ПК нужно время выполниться
-    /// (например "открой хром" перед "включи плейлист"), иначе они прилетят почти одновременно.
+    var steps: [String]
     var delayBetweenSteps: Double
 
     init(name: String, steps: [String], delayBetweenSteps: Double = 1.0) {
@@ -1158,7 +1300,6 @@ struct Macro: Identifiable, Codable, Equatable {
 // MARK: - Macro Store
 final class MacroStore: ObservableObject {
     @Published private(set) var macros: [Macro] = []
-
     private let storageKey = "lupin_macros_v1"
 
     init() {
@@ -1174,26 +1315,14 @@ final class MacroStore: ObservableObject {
         Macro(name: "Тихий вечер", steps: ["громкость 20", "на наушники"], delayBetweenSteps: 1.0)
     ]
 
-    func add(_ macro: Macro) {
-        macros.append(macro)
-        save()
-    }
-
+    func add(_ macro: Macro) { macros.append(macro); save() }
     func update(_ macro: Macro) {
         guard let idx = macros.firstIndex(where: { $0.id == macro.id }) else { return }
         macros[idx] = macro
         save()
     }
-
-    func delete(at offsets: IndexSet) {
-        macros.remove(atOffsets: offsets)
-        save()
-    }
-
-    func delete(_ macro: Macro) {
-        macros.removeAll { $0.id == macro.id }
-        save()
-    }
+    func delete(at offsets: IndexSet) { macros.remove(atOffsets: offsets); save() }
+    func delete(_ macro: Macro) { macros.removeAll { $0.id == macro.id }; save() }
 
     private func save() {
         if let data = try? JSONEncoder().encode(macros) {
@@ -1203,15 +1332,11 @@ final class MacroStore: ObservableObject {
 
     private func load() {
         guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode([Macro].self, from: data) else {
-            return
-        }
+              let decoded = try? JSONDecoder().decode([Macro].self, from: data) else { return }
         macros = decoded
     }
 }
 
-// MARK: - Macro Runner
-/// Выполняет шаги макроса последовательно с задержкой между ними.
 enum MacroRunner {
     static func run(_ macro: Macro, bot: TelegramBotConnection, history: CommandHistoryStore) {
         for (index, step) in macro.steps.enumerated() {
@@ -1224,7 +1349,6 @@ enum MacroRunner {
     }
 }
 
-// MARK: - Macros List View
 struct MacrosView: View {
     @ObservedObject var botConnection: TelegramBotConnection
     @ObservedObject var historyStore: CommandHistoryStore
@@ -1321,14 +1445,13 @@ private struct MacroRow: View {
     }
 }
 
-// MARK: - Macro Editor
 private struct MacroEditorView: View {
     @ObservedObject var store: MacroStore
     let macro: Macro?
 
     @Environment(\.dismiss) var dismiss
     @State private var name: String = ""
-    @State private var stepsText: String = "" // одна команда на строку
+    @State private var stepsText: String = ""
     @State private var delay: Double = 1.0
 
     var body: some View {
@@ -1397,10 +1520,7 @@ private struct MacroEditorView: View {
     }
 
     private var parsedSteps: [String] {
-        stepsText
-            .split(separator: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        stepsText.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 
     private func save() {
@@ -1416,17 +1536,9 @@ private struct MacroEditorView: View {
     }
 }
 
-// ======================================================================
-
 // MARK: - Notification Manager
-/// Важно: это Local Notifications, а не APNs push.
-/// Они позволяют показать уведомление, когда ответ от бота уже пришёл и приложение
-/// активно (foreground) либо было недавно активно в фоне (background fetch/timer работает,
-/// пока iOS не выгрузила приложение из памяти). Настоящий push "в любой момент, даже если
-/// приложение выгружено" требует APNs-сервера на стороне Python (см. заметку ниже).
 final class NotificationManager: NSObject, ObservableObject {
     static let shared = NotificationManager()
-
     @Published var permissionGranted = false
 
     private override init() {
@@ -1436,13 +1548,10 @@ final class NotificationManager: NSObject, ObservableObject {
 
     func requestAuthorization() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
-            DispatchQueue.main.async {
-                self.permissionGranted = granted
-            }
+            DispatchQueue.main.async { self.permissionGranted = granted }
         }
     }
 
-    /// Немедленное уведомление — например, о новом ответе бота или срабатывании алерта мониторинга.
     func notifyNow(title: String, body: String, identifier: String = UUID().uuidString) {
         guard permissionGranted else { return }
         let content = UNMutableNotificationContent()
@@ -1453,68 +1562,20 @@ final class NotificationManager: NSObject, ObservableObject {
         let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }
-
-    /// Отложенное уведомление — используется для напоминаний из ReminderScheduler.
-    /// intervalSeconds — через сколько секунд сработает; для точной даты используй
-    /// UNCalendarNotificationTrigger вместо UNTimeIntervalNotificationTrigger.
-    @discardableResult
-    func scheduleReminder(id: String, title: String, body: String, fireDate: Date) -> Bool {
-        guard permissionGranted else { return false }
-        let interval = fireDate.timeIntervalSinceNow
-        guard interval > 0 else { return false }
-
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = .default
-
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false)
-        let request = UNNotificationRequest(identifier: id, content: content, trigger: trigger)
-        UNUserNotificationCenter.current().add(request)
-        return true
-    }
-
-    func cancelReminder(id: String) {
-        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [id])
-    }
-
-    func cancelAllReminders() {
-        UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
-    }
 }
 
-// MARK: - Foreground presentation
 extension NotificationManager: UNUserNotificationCenterDelegate {
-    // Показываем баннер и звук, даже если приложение открыто (по умолчанию iOS их глушит).
-    func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                 willPresent notification: UNNotification,
-                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner, .sound, .badge])
     }
 }
 
-// ======================================================================
-
-// ВАЖНО (требования для реальной сборки):
-// 1. Таргет должен поддерживать iOS 16+ (App Intents framework).
-// 2. Bot Token/Chat ID сейчас захардкожены в TelegramBotConnection — App Intents создают
-//    СВОЙ экземпляр соединения (см. IntentBotBridge ниже), а не переиспользуют тот,
-//    что живёт в ContentView, потому что интенты выполняются вне UI-процесса приложения.
-// 3. Добавь в Info.plist / Target Capabilities ничего дополнительного не нужно —
-//    App Intents регистрируются автоматически через AppShortcutsProvider ниже.
-
-// MARK: - Shared config
-/// Единственное место, где живут токен и chat_id. И TelegramBotConnection (UI-процесс),
-/// и IntentBotBridge (Siri-интенты, отдельный процесс) читают отсюда — обновил тут,
-/// обновилось сразу везде.
+// MARK: - App Intents Bridge
 enum LupinConfig {
     static let botToken = "8602600416:AAGgYHxYL9hbyqlQdxPIPFXYIspZoUoeN8s"
     static let chatId: Int64 = 7106785409
 }
 
-// MARK: - Bridge: минимальная обёртка для отправки команды из интента
-/// Интенты не имеют доступа к @StateObject-инстансам живого UI, поэтому здесь —
-/// собственный лёгкий клиент с той же логикой отправки, что и в TelegramBotConnection.
 enum IntentBotBridge {
     static func send(_ text: String) async -> Bool {
         let urlString = "https://api.telegram.org/bot\(LupinConfig.botToken)/sendMessage"
@@ -1523,36 +1584,24 @@ enum IntentBotBridge {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "chat_id": LupinConfig.chatId,
-            "text": text
-        ])
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["chat_id": LupinConfig.chatId, "text": text])
 
         do {
             let (data, _) = try await URLSession.shared.data(for: request)
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let ok = json["ok"] as? Bool {
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let ok = json["ok"] as? Bool {
                 return ok
             }
-        } catch {
-            return false
-        }
+        } catch { return false }
         return false
     }
 }
 
-// MARK: - Power Actions
 enum PowerAction: String, AppEnum {
     case lock, sleep, reboot, shutdown
-
     static var typeDisplayRepresentation: TypeDisplayRepresentation = "Действие питания"
     static var caseDisplayRepresentations: [PowerAction: DisplayRepresentation] = [
-        .lock: "Заблокировать",
-        .sleep: "Спящий режим",
-        .reboot: "Перезагрузить",
-        .shutdown: "Выключить"
+        .lock: "Заблокировать", .sleep: "Спящий режим", .reboot: "Перезагрузить", .shutdown: "Выключить"
     ]
-
     var command: String {
         switch self {
         case .lock: return "заблокируй пк"
@@ -1570,17 +1619,14 @@ struct PowerControlIntent: AppIntent {
     @Parameter(title: "Действие")
     var action: PowerAction
 
-    static var parameterSummary: some ParameterSummary {
-        Summary("\(\.$action) ПК")
-    }
+    static var parameterSummary: some ParameterSummary { Summary("\(\.$action) ПК") }
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let ok = await IntentBotBridge.send(action.command)
-        return .result(dialog: IntentDialog(stringLiteral: ok ? "Команда отправлена." : "Не удалось отправить команду — проверь соединение."))
+        return .result(dialog: IntentDialog(stringLiteral: ok ? "Команда отправлена." : "Не удалось отправить команду."))
     }
 }
 
-// MARK: - Wake command (пример "разбуди Люпена")
 struct WakeLupinIntent: AppIntent {
     static var title: LocalizedStringResource = "Разбудить Люпена"
     static var description = IntentDescription("Отправляет тестовую команду, чтобы проверить, что бот на связи.")
@@ -1591,17 +1637,12 @@ struct WakeLupinIntent: AppIntent {
     }
 }
 
-// MARK: - Media control
 enum MediaAction: String, AppEnum {
     case prev, toggle, next
-
     static var typeDisplayRepresentation: TypeDisplayRepresentation = "Медиа-действие"
     static var caseDisplayRepresentations: [MediaAction: DisplayRepresentation] = [
-        .prev: "Предыдущий трек",
-        .toggle: "Пауза/Play",
-        .next: "Следующий трек"
+        .prev: "Предыдущий трек", .toggle: "Пауза/Play", .next: "Следующий трек"
     ]
-
     var command: String {
         switch self {
         case .prev: return "предыдущий трек"
@@ -1618,9 +1659,7 @@ struct MediaControlIntent: AppIntent {
     @Parameter(title: "Действие")
     var action: MediaAction
 
-    static var parameterSummary: some ParameterSummary {
-        Summary("\(\.$action)")
-    }
+    static var parameterSummary: some ParameterSummary { Summary("\(\.$action)") }
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let ok = await IntentBotBridge.send(action.command)
@@ -1628,65 +1667,21 @@ struct MediaControlIntent: AppIntent {
     }
 }
 
-// MARK: - Screenshot
 struct TakeScreenshotIntent: AppIntent {
     static var title: LocalizedStringResource = "Скриншот ПК"
     static var description = IntentDescription("Запросить скриншот экрана ПК через LUPIN.")
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let ok = await IntentBotBridge.send("скриншот")
-        return .result(dialog: IntentDialog(stringLiteral: ok ? "Запрос на скриншот отправлен." : "Не удалось отправить запрос."))
+        return .result(dialog: IntentDialog(stringLiteral: ok ? "Запрос отправлен." : "Ошибка отправки."))
     }
 }
 
-// MARK: - Free-form command ("Эй Siri, скажи Люпену открой хром")
-struct SendCustomCommandIntent: AppIntent {
-    static var title: LocalizedStringResource = "Команда для Люпена"
-    static var description = IntentDescription("Отправляет произвольный текст как команду на ПК.")
-
-    @Parameter(title: "Команда")
-    var text: String
-
-    static var parameterSummary: some ParameterSummary {
-        Summary("Отправить команду \(\.$text)")
-    }
-
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let ok = await IntentBotBridge.send(text)
-        return .result(dialog: IntentDialog(stringLiteral: ok ? "Отправлено: \(text)" : "Не удалось отправить команду."))
-    }
-}
-
-// MARK: - App Shortcuts Provider
-/// Регистрирует готовые фразы для Siri/Shortcuts без ручной настройки пользователем.
 struct LupinShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
-        AppShortcut(
-            intent: WakeLupinIntent(),
-            phrases: ["Разбуди \(.applicationName)", "\(.applicationName) на связи"],
-            shortTitle: "Разбудить Люпена",
-            systemImageName: "power.circle"
-        )
-
-        AppShortcut(
-            intent: PowerControlIntent(),
-            phrases: ["Выключи ПК через \(.applicationName)", "Заблокируй ПК через \(.applicationName)"],
-            shortTitle: "Питание ПК",
-            systemImageName: "power"
-        )
-
-        AppShortcut(
-            intent: MediaControlIntent(),
-            phrases: ["\(.applicationName), переключи трек", "\(.applicationName), пауза"],
-            shortTitle: "Медиа",
-            systemImageName: "playpause.fill"
-        )
-
-        AppShortcut(
-            intent: TakeScreenshotIntent(),
-            phrases: ["Сделай скриншот через \(.applicationName)"],
-            shortTitle: "Скриншот",
-            systemImageName: "camera.viewfinder"
-        )
+        AppShortcut(intent: WakeLupinIntent(), phrases: ["Разбуди \(.applicationName)", "\(.applicationName) на связи"], shortTitle: "Разбудить Люпена", systemImageName: "power.circle")
+        AppShortcut(intent: PowerControlIntent(), phrases: ["Выключи ПК через \(.applicationName)", "Заблокируй ПК через \(.applicationName)"], shortTitle: "Питание ПК", systemImageName: "power")
+        AppShortcut(intent: MediaControlIntent(), phrases: ["\(.applicationName), переключи трек", "\(.applicationName), пауза"], shortTitle: "Медиа", systemImageName: "playpause.fill")
+        AppShortcut(intent: TakeScreenshotIntent(), phrases: ["Сделай скриншот через \(.applicationName)"], shortTitle: "Скриншот", systemImageName: "camera.viewfinder")
     }
 }
