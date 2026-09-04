@@ -1,5 +1,5 @@
 // LUPIN — единый файл (main app, история команд, макросы, сетевая диагностика, Siri Shortcuts / App Intents)
-// v3.1 — исправлены разрешения микрофона и структура сетевых утилит
+// v3.2 — полностью исправлен синтаксис AppShortcutsProvider и добавлены апи iOS 17+ для разрешений микрофона
 
 import SwiftUI
 import AVFoundation
@@ -22,7 +22,6 @@ final class NetworkDiagnostics: ObservableObject {
     @Published var scanResults: [String] = []
     @Published var pingStatus: String = "Готов"
 
-    // Безопасная проверка доступности портов на собственном узле
     func checkPort(host: String, port: UInt16, completion: @escaping (Bool) -> Void) {
         let endpoint = NWEndpoint.hostPort(host: .init(host), port: .init(integerLiteral: port))
         let conn = NWConnection(to: endpoint, using: .tcp)
@@ -190,7 +189,7 @@ class TelegramBotConnection: ObservableObject {
     func clearClipboard() { sendCommand("очистить буфер") }
 }
 
-// MARK: - Voice Assistant (С защитой от краша разрешений)
+// MARK: - Voice Assistant
 class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var synthesizer = AVSpeechSynthesizer()
     private var speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ru-RU"))
@@ -314,7 +313,7 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         }.resume()
     }
 
-    // ИСПРАВЛЕНИЕ КРАША: последовательный запрос прав доступа
+    // Совместимый с iOS 17+ и iOS 16 запрос разрешений
     func startListening() {
         SFSpeechRecognizer.requestAuthorization { authStatus in
             DispatchQueue.main.async {
@@ -324,7 +323,7 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                     return
                 }
                 
-                AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                let handlePermissionResult: (Bool) -> Void = { granted in
                     DispatchQueue.main.async {
                         if granted {
                             self.micAccessDenied = false
@@ -333,6 +332,16 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                             self.micAccessDenied = true
                             self.recognizedText = "Доступ к микрофону заблокирован"
                         }
+                    }
+                }
+
+                if #available(iOS 17.0, *) {
+                    AVAudioApplication.requestRecordPermission { granted in
+                        handlePermissionResult(granted)
+                    }
+                } else {
+                    AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                        handlePermissionResult(granted)
                     }
                 }
             }
@@ -1069,11 +1078,18 @@ enum IntentBotBridge {
     }
 }
 
+// Исправлена синтаксическая ошибка генератора списка интентов
 struct LupinShortcuts: AppShortcutsProvider {
+    @AppShortcutsBuilder
     static var appShortcuts: [AppShortcut] {
-        [
-            AppShortcut(intent: WakeLupinIntent(), phrases: ["Разбуди \(.applicationName)", "\(.applicationName) на связи"],
-                        shortTitle: "Разбудить Люпена", systemImageName: "power.circle")
-        ]
+        AppShortcut(
+            intent: WakeLupinIntent(),
+            phrases: [
+                "Разбуди \(.applicationName)",
+                "\(.applicationName) на связи"
+            ],
+            shortTitle: "Разбудить Люпена",
+            systemImageName: "power.circle"
+        )
     }
 }
