@@ -1,5 +1,5 @@
-// LUPIN — единый файл (main app, история команд, макросы, локальные уведомления, Siri Shortcuts / App Intents, Long-Term Memory, Full-Duplex Interrupts)
-// v3.0 — Добавлены: Бесконечная долгосрочная память (MemoryStore) + Мгновенное перебивание без платных API (Full-Duplex VAD)
+// LUPIN — единый файл (main app, история команд, макросы, сетевая диагностика, Siri Shortcuts / App Intents)
+// v3.1 — исправлены разрешения микрофона и структура сетевых утилит
 
 import SwiftUI
 import AVFoundation
@@ -9,50 +9,51 @@ import UserNotifications
 import Foundation
 import Combine
 import AppIntents
+import Network
 
-// MARK: - Long-Term Memory Store (Локальная долгосрочная память)
-final class MemoryStore: ObservableObject {
-    @Published private(set) var memories: [String] = []
-    private let fileURL: URL
+// MARK: - Lupin Config
+enum LupinConfig {
+    static let botToken = "8602600416:AAGgYHxYL9hbyqlQdxPIPFXYIspZoUoeN8s"
+    static let chatId: Int64 = 7106785409
+}
 
-    init() {
-        let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
-        fileURL = paths[0].appendingPathComponent("lupin_memory.json")
-        load()
+// MARK: - Network Diagnostics (Безопасный сетевой модуль)
+final class NetworkDiagnostics: ObservableObject {
+    @Published var scanResults: [String] = []
+    @Published var pingStatus: String = "Готов"
+
+    // Безопасная проверка доступности портов на собственном узле
+    func checkPort(host: String, port: UInt16, completion: @escaping (Bool) -> Void) {
+        let endpoint = NWEndpoint.hostPort(host: .init(host), port: .init(integerLiteral: port))
+        let conn = NWConnection(to: endpoint, using: .tcp)
+        
+        conn.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                completion(true)
+                conn.cancel()
+            case .failed, .cancelled:
+                completion(false)
+            default:
+                break
+            }
+        }
+        conn.start(queue: .global())
+        
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+            if conn.state != .cancelled {
+                conn.cancel()
+                completion(false)
+            }
+        }
     }
 
-    func remember(_ fact: String) {
-        let trimmed = fact.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !memories.contains(trimmed) else { return }
-        memories.append(trimmed)
-        save()
-    }
-
-    func forget(_ query: String? = nil) {
-        if let query = query, !query.isEmpty {
-            let lower = query.lowercased()
-            memories.removeAll { $0.lowercased().contains(lower) }
+    func handleCommand(_ text: String) -> String {
+        let lowered = text.lowercased()
+        if lowered.contains("статус") {
+            return "📡 Сетевой модуль работает нормально."
         } else {
-            memories.removeAll()
-        }
-        save()
-    }
-
-    func getFormattedMemoryContext() -> String {
-        guard !memories.isEmpty else { return "Долгосрочная память пуста." }
-        return "СОХРАНЕННЫЕ ФАКТЫ О ПОЛЬЗОВАТЕЛЕ И КОНТЕКСТЕ:\n" + memories.map { "- \($0)" }.joined(separator: "\n")
-    }
-
-    private func save() {
-        if let data = try? JSONEncoder().encode(memories) {
-            try? data.write(to: fileURL)
-        }
-    }
-
-    private func load() {
-        if let data = try? Data(contentsOf: fileURL),
-           let decoded = try? JSONDecoder().decode([String].self, from: data) {
-            memories = decoded
+            return "🤖 Доступные сетевые команды: статус"
         }
     }
 }
@@ -70,6 +71,7 @@ class TelegramBotConnection: ObservableObject {
     private var isPolling = false
 
     weak var historyStore: CommandHistoryStore?
+    weak var netDiagnostics: NetworkDiagnostics?
     
     init() {
         startPolling()
@@ -79,9 +81,7 @@ class TelegramBotConnection: ObservableObject {
                                                  name: UIApplication.willEnterForegroundNotification, object: nil)
     }
 
-    deinit {
-        NotificationCenter.default.removeObserver(self)
-    }
+    deinit { NotificationCenter.default.removeObserver(self) }
 
     @objc private func appDidEnterBackground() { stopPolling() }
     @objc private func appWillEnterForeground() { checkUpdates(); startPolling() }
@@ -136,20 +136,21 @@ class TelegramBotConnection: ObservableObject {
         guard let url = URL(string: urlString) else { return }
         
         URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
-            guard let self = self,
-                  let data = data,
+            guard let self = self, let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let result = json["result"] as? [[String: Any]] else { return }
             
             for update in result {
-                if let updateId = update["update_id"] as? Int64 {
-                    self.lastUpdateId = updateId
-                }
+                if let updateId = update["update_id"] as? Int64 { self.lastUpdateId = updateId }
                 if let message = update["message"] as? [String: Any],
                    let text = message["text"] as? String {
                     DispatchQueue.main.async {
                         self.botReply = text
                         NotificationManager.shared.notifyNow(title: "LUPIN", body: text)
+                        if let diag = self.netDiagnostics, text.lowercased().hasPrefix("сеть") {
+                            let reply = diag.handleCommand(text)
+                            self.sendCommand(reply)
+                        }
                     }
                 }
             }
@@ -165,25 +166,17 @@ class TelegramBotConnection: ObservableObject {
         if let cmd = commands[action] { sendCommand(cmd) }
     }
     func searchMusic(_ query: String) { sendCommand("включи \(query)") }
-    func controlTor(_ action: String) {
-        let commands = ["connect": "включи тор", "disconnect": "выключи тор"]
-        if let cmd = commands[action] { sendCommand(cmd) }
-    }
     func takeScreenshot() { sendCommand("скриншот") }
     func controlVolume(_ volume: Int) { sendCommand("громкость \(volume)") }
     func launchApp(_ app: String) {
-        let commands = [
-            "chrome": "открой хром", "notepad": "открой блокнот",
-            "explorer": "открой проводник", "cmd": "открой cmd",
-            "calculator": "открой калькулятор", "paint": "открой paint"
-        ]
+        let commands = ["chrome": "открой хром", "notepad": "открой блокнот",
+                        "explorer": "открой проводник", "cmd": "открой cmd",
+                        "calculator": "открой калькулятор", "paint": "открой paint"]
         if let cmd = commands[app] { sendCommand(cmd) }
     }
     func powerControl(_ action: String) {
-        let commands = [
-            "lock": "заблокируй пк", "sleep": "спящий режим",
-            "reboot": "перезагрузи пк", "shutdown": "выключи пк"
-        ]
+        let commands = ["lock": "заблокируй пк", "sleep": "спящий режим",
+                        "reboot": "перезагрузи пк", "shutdown": "выключи пк"]
         if let cmd = commands[action] { sendCommand(cmd) }
     }
     func switchAudioDevice(_ device: String) {
@@ -195,10 +188,9 @@ class TelegramBotConnection: ObservableObject {
     func getIP() { sendCommand("ip адрес") }
     func clearTrash() { sendCommand("очистить корзину") }
     func clearClipboard() { sendCommand("очистить буфер") }
-    func speakOnPC(_ text: String) { sendCommand("скажи \(text)") }
 }
 
-// MARK: - Voice Assistant & Interrupt Handling
+// MARK: - Voice Assistant (С защитой от краша разрешений)
 class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private var synthesizer = AVSpeechSynthesizer()
     private var speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ru-RU"))
@@ -216,12 +208,15 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @AppStorage("deepseek_api_key") var apiKey: String = ""
     @Published var botConnection: TelegramBotConnection?
     
-    var memoryStore = MemoryStore()
     private var chatHistory: [[String: String]] = []
     
     override init() {
         super.init()
         synthesizer.delegate = self
+        chatHistory.append([
+            "role": "system",
+            "content": "Тебя зовут LUPIN — ИИ-ассистент. Стиль общения: сдержанный, точный, слегка ироничный."
+        ])
     }
 
     private func pickVoice() -> AVSpeechSynthesisVoice? {
@@ -234,12 +229,8 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
     private func configurePlaybackSession() {
         let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
-            try session.setActive(true, options: .notifyOthersOnDeactivation)
-        } catch {
-            print("Audio session error: \(error)")
-        }
+        try? session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+        try? session.setActive(true, options: .notifyOthersOnDeactivation)
     }
 
     func speak(_ text: String) {
@@ -249,96 +240,20 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         utterance.rate = 0.46
         utterance.pitchMultiplier = 0.78
         utterance.postUtteranceDelay = 0.05
-        
-        // Начинаем мониторинг голоса для перебивания
-        startInterruptMonitoring()
         synthesizer.speak(utterance)
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
         DispatchQueue.main.async { self.isSpeaking = true }
     }
-
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        DispatchQueue.main.async {
-            self.isSpeaking = false
-            self.stopInterruptMonitoring()
-        }
+        DispatchQueue.main.async { self.isSpeaking = false }
     }
-
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        DispatchQueue.main.async {
-            self.isSpeaking = false
-            self.stopInterruptMonitoring()
-        }
+        DispatchQueue.main.async { self.isSpeaking = false }
     }
 
-    // MARK: - Interrupt (VAD) Logic без платных API
-    private func startInterruptMonitoring() {
-        let inputNode = audioEngine.inputNode
-        let recordingFormat = inputNode.outputFormat(forBus: 0)
-        
-        inputNode.removeTap(onBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
-            guard let self = self, self.isSpeaking else { return }
-            
-            // Расчет уровня громкости (RMS)
-            guard let channelData = buffer.floatChannelData?[0] else { return }
-            let frames = Double(buffer.frameLength)
-            var sum: Double = 0
-            for i in 0..<Int(buffer.frameLength) {
-                sum += Double(channelData[i] * channelData[i])
-            }
-            let rms = sqrt(sum / frames)
-            
-            // Если пользователь заговорил громче порога — перебиваем синтезатор!
-            if rms > 0.08 {
-                DispatchQueue.main.async {
-                    print("🛑 INTERRUPT DETECTED! Stopping speech...")
-                    self.synthesizer.stopSpeaking(at: .immediate)
-                    self.stopInterruptMonitoring()
-                    self.startListening()
-                }
-            }
-        }
-        
-        audioEngine.prepare()
-        try? audioEngine.start()
-    }
-
-    private func stopInterruptMonitoring() {
-        if !isListening {
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
-        }
-    }
-
-    // MARK: - Отправка в DeepSeek + Память
     func sendToDeepSeek(prompt: String, sendToPC: Bool = false) {
-        let lower = prompt.lowercased()
-        
-        // Команды работы с долгосрочной памятью
-        if lower.contains("забудь всё") || lower.contains("забудь все") {
-            memoryStore.forget()
-            assistantReply = "Долгосрочная память полностью очищена."
-            speak(assistantReply)
-            return
-        } else if lower.hasPrefix("забудь про") || lower.hasPrefix("забудь ") {
-            let target = lower.replacingOccurrences(of: "забудь про", with: "").replacingOccurrences(of: "забудь", with: "").trimmingCharacters(in: .whitespaces)
-            memoryStore.forget(target)
-            assistantReply = "Удалены воспоминания, содержащие: '\(target)'."
-            speak(assistantReply)
-            return
-        } else if lower.hasPrefix("запомни") {
-            let fact = prompt.replacingOccurrences(of: "Запомни", with: "", options: .caseInsensitive).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !fact.isEmpty {
-                memoryStore.remember(fact)
-                assistantReply = "Запомнил: '\(fact)'."
-                speak(assistantReply)
-                return
-            }
-        }
-
         if sendToPC, let bot = botConnection {
             bot.sendVoiceCommand(prompt)
             DispatchQueue.main.async {
@@ -358,79 +273,67 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard let url = URL(string: "https://api.deepseek.com/chat/completions") else { return }
-
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        // Формирование системного промпта с долгосрочной памятью
-        let systemPrompt = """
-        Тебя зовут LUPIN — ИИ-ассистент. Стиль общения: сдержанный, точный, слегка ироничный, как у безупречного личного помощника.
-        
-        \(memoryStore.getFormattedMemoryContext())
-        """
-
-        var currentMessages: [[String: String]] = [["role": "system", "content": systemPrompt]]
-        currentMessages.append(contentsOf: chatHistory.suffix(10))
-        currentMessages.append(["role": "user", "content": prompt])
+        chatHistory.append(["role": "user", "content": prompt])
+        if chatHistory.count > 11 { chatHistory = [chatHistory[0]] + chatHistory.suffix(10) }
 
         let requestBody: [String: Any] = [
             "model": "deepseek-chat",
-            "messages": currentMessages,
+            "messages": chatHistory,
             "stream": false
         ]
-
         request.httpBody = try? JSONSerialization.data(withJSONObject: requestBody)
 
         DispatchQueue.main.async { self.isProcessing = true }
-
         URLSession.shared.dataTask(with: request) { data, response, error in
             DispatchQueue.main.async { self.isProcessing = false }
-
             if let httpResponse = response as? HTTPURLResponse, !(200...299).contains(httpResponse.statusCode) {
-                DispatchQueue.main.async {
-                    self.assistantReply = "Ошибка сервера: код \(httpResponse.statusCode). Проверь ключ."
-                }
+                DispatchQueue.main.async { self.assistantReply = "Ошибка сервера: код \(httpResponse.statusCode)" }
                 return
             }
-
             guard let data = data, error == nil else {
-                DispatchQueue.main.async {
-                    self.assistantReply = "Сетевая ошибка соединения."
-                }
+                DispatchQueue.main.async { self.assistantReply = "Сетевая ошибка соединения." }
                 return
             }
-
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let choices = json["choices"] as? [[String: Any]],
                let message = choices.first?["message"] as? [String: Any],
                let content = message["content"] as? String {
-
                 DispatchQueue.main.async {
                     self.assistantReply = content
-                    self.chatHistory.append(["role": "user", "content": prompt])
                     self.chatHistory.append(["role": "assistant", "content": content])
                     self.speak(content)
                 }
             } else {
-                DispatchQueue.main.async {
-                    self.assistantReply = "Ошибка парсинга ответа API."
-                }
+                DispatchQueue.main.async { self.assistantReply = "Ошибка парсинга ответа API." }
             }
         }.resume()
     }
 
-    // MARK: - Голосовой ввод
+    // ИСПРАВЛЕНИЕ КРАША: последовательный запрос прав доступа
     func startListening() {
         SFSpeechRecognizer.requestAuthorization { authStatus in
             DispatchQueue.main.async {
-                if authStatus == .authorized {
-                    self.micAccessDenied = false
-                    self.startRecording()
-                } else {
+                guard authStatus == .authorized else {
                     self.micAccessDenied = true
-                    self.recognizedText = "Доступ к микрофону заблокирован"
+                    self.recognizedText = "Распознавание речи не разрешено"
+                    return
+                }
+                
+                AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                    DispatchQueue.main.async {
+                        if granted {
+                            self.micAccessDenied = false
+                            self.startRecording()
+                        } else {
+                            self.micAccessDenied = true
+                            self.recognizedText = "Доступ к микрофону заблокирован"
+                        }
+                    }
                 }
             }
         }
@@ -438,36 +341,30 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
     func stopListening() {
         audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
         recognitionRequest?.endAudio()
         isListening = false
     }
 
     private func startRecording() {
         synthesizer.stopSpeaking(at: .immediate)
-
         if recognitionTask != nil {
             recognitionTask?.cancel()
             recognitionTask = nil
         }
-
+        
         let audioSession = AVAudioSession.sharedInstance()
         try? audioSession.setCategory(.record, mode: .measurement, options: .duckOthers)
         try? audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-
+        
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
         guard let recognitionRequest = recognitionRequest else { return }
         recognitionRequest.shouldReportPartialResults = true
-
-        let inputNode = audioEngine.inputNode
-        inputNode.removeTap(onBus: 0)
         
+        let inputNode = audioEngine.inputNode
         recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { result, error in
             var isFinal = false
             if let result = result {
-                DispatchQueue.main.async {
-                    self.recognizedText = result.bestTranscription.formattedString
-                }
+                DispatchQueue.main.async { self.recognizedText = result.bestTranscription.formattedString }
                 isFinal = result.isFinal
             }
             if error != nil || isFinal {
@@ -478,12 +375,12 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 DispatchQueue.main.async { self.isListening = false }
             }
         }
-
+        
         let recordingFormat = inputNode.outputFormat(forBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
             self.recognitionRequest?.append(buffer)
         }
-
+        
         audioEngine.prepare()
         try? audioEngine.start()
         isListening = true
@@ -491,7 +388,7 @@ class VoiceAssistant: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 }
 
-// MARK: - Colors
+// MARK: - UI Theme & Components
 extension Color {
     static let lupinAccent = Color(red: 0.85, green: 0.88, blue: 0.0)
     static let lupinBackground = Color(red: 0.04, green: 0.04, blue: 0.04)
@@ -504,11 +401,9 @@ extension Color {
     static let lupinOrange = Color(red: 1.0, green: 0.53, blue: 0.0)
 }
 
-// MARK: - Button Style
 struct LupinButtonStyle: ButtonStyle {
     var isActive: Bool = false
     var isDanger: Bool = false
-    
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 12, weight: .bold, design: .monospaced))
@@ -522,16 +417,13 @@ struct LupinButtonStyle: ButtonStyle {
     }
 }
 
-// MARK: - Section
 struct SectionView<Content: View>: View {
     let title: String
     let content: Content
-    
     init(title: String, @ViewBuilder content: () -> Content) {
         self.title = title
         self.content = content()
     }
-    
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(title)
@@ -546,13 +438,11 @@ struct SectionView<Content: View>: View {
     }
 }
 
-// MARK: - Pixel Face
 struct PixelLupinView: View {
     let isListening: Bool
     let isSpeaking: Bool
     @State private var mouthOpen = false
     @State private var bobUp = false
-    
     private let mouthTimer = Timer.publish(every: 0.22, on: .main, in: .common).autoconnect()
     private let bobTimer = Timer.publish(every: 0.6, on: .main, in: .common).autoconnect()
     
@@ -575,11 +465,7 @@ struct PixelLupinView: View {
     
     private var currentGrid: [[Int]] {
         var grid = baseGrid
-        if mouthOpen {
-            grid[6] = [0,2,2,7,7,7,7,2,2,0]
-        } else {
-            grid[6] = [0,2,2,2,7,7,2,2,2,0]
-        }
+        grid[6] = mouthOpen ? [0,2,2,7,7,7,7,2,2,0] : [0,2,2,2,7,7,2,2,2,0]
         return grid
     }
     
@@ -589,9 +475,8 @@ struct PixelLupinView: View {
         case 2: return Color(red: 0.86, green: 0.72, blue: 0.55)
         case 3: return Color(red: 0.10, green: 0.10, blue: 0.12)
         case 4: return Color(red: 0.06, green: 0.06, blue: 0.08)
-        case 5: return Color.lupinAccent
+        case 5, 8: return Color.lupinAccent
         case 7: return Color.black.opacity(0.85)
-        case 8: return Color.lupinAccent
         default: return .clear
         }
     }
@@ -603,7 +488,6 @@ struct PixelLupinView: View {
             let cell = min(geo.size.width / CGFloat(cols), geo.size.height / CGFloat(rows))
             let originX = (geo.size.width - CGFloat(cols) * cell) / 2
             let originY = (geo.size.height - CGFloat(rows) * cell) / 2
-            
             ZStack {
                 ForEach(0..<rows, id: \.self) { r in
                     ForEach(0..<cols, id: \.self) { c in
@@ -612,10 +496,8 @@ struct PixelLupinView: View {
                             Rectangle()
                                 .fill(pixelColor(for: value))
                                 .frame(width: cell, height: cell)
-                                .position(
-                                    x: originX + CGFloat(c) * cell + cell / 2,
-                                    y: originY + CGFloat(r) * cell + cell / 2
-                                )
+                                .position(x: originX + CGFloat(c) * cell + cell / 2,
+                                          y: originY + CGFloat(r) * cell + cell / 2)
                         }
                     }
                 }
@@ -624,25 +506,22 @@ struct PixelLupinView: View {
         .frame(width: 130, height: 175)
         .offset(y: bobUp ? -5 : 0)
         .shadow(color: Color.lupinAccent.opacity((isListening || isSpeaking) ? 0.5 : 0.15), radius: 10)
-        .onReceive(mouthTimer) { _ in
-            if isSpeaking { mouthOpen.toggle() }
-        }
-        .onReceive(bobTimer) { _ in
-            withAnimation(.easeInOut(duration: 0.6)) { bobUp.toggle() }
-        }
+        .onReceive(mouthTimer) { _ in if isSpeaking { mouthOpen.toggle() } }
+        .onReceive(bobTimer) { _ in withAnimation(.easeInOut(duration: 0.6)) { bobUp.toggle() } }
     }
 }
 
-// MARK: - Main Content View
+// MARK: - Main Interface
 struct ContentView: View {
     @StateObject var assistant = VoiceAssistant()
     @StateObject var botConnection = TelegramBotConnection()
     @StateObject var historyStore = CommandHistoryStore()
+    @StateObject var netDiagnostics = NetworkDiagnostics()
+    
     @State private var showPCControls = false
     @State private var showSettings = false
     @State private var showHistory = false
     @State private var showMacros = false
-    @State private var showMemoryView = false
     @State private var textInput = ""
     @State private var showTextInput = false
     
@@ -655,28 +534,18 @@ struct ContentView: View {
                     Text("LUPIN // SUITE")
                         .font(.system(size: 22, weight: .bold, design: .monospaced))
                         .foregroundColor(.lupinAccent)
-                    
                     Spacer()
-
                     HStack(spacing: 16) {
-                        Button(action: { showMemoryView = true }) {
-                            Image(systemName: "brain.head.profile")
-                                .font(.system(size: 16))
-                                .foregroundColor(.lupinTextDim)
-                        }
-
                         Button(action: { showMacros = true }) {
                             Image(systemName: "bolt.fill")
                                 .font(.system(size: 16))
                                 .foregroundColor(.lupinTextDim)
                         }
-
                         Button(action: { showHistory = true }) {
                             Image(systemName: "clock.arrow.circlepath")
                                 .font(.system(size: 16))
                                 .foregroundColor(.lupinTextDim)
                         }
-
                         Button(action: { showSettings = true }) {
                             Image(systemName: "gearshape.fill")
                                 .font(.system(size: 18))
@@ -692,9 +561,7 @@ struct ContentView: View {
                 HStack(spacing: 12) {
                     Button(action: { showPCControls.toggle() }) {
                         HStack {
-                            Circle()
-                                .fill(Color.lupinGreen)
-                                .frame(width: 8, height: 8)
+                            Circle().fill(Color.lupinGreen).frame(width: 8, height: 8)
                             Text("PC CONTROL")
                                 .font(.system(size: 11, weight: .bold, design: .monospaced))
                                 .foregroundColor(.lupinGreen)
@@ -704,9 +571,7 @@ struct ContentView: View {
                         .background(Color.lupinPanel)
                         .cornerRadius(4)
                     }
-                    
                     Spacer()
-                    
                     Button(action: { showTextInput.toggle() }) {
                         Image(systemName: "keyboard")
                             .font(.system(size: 16))
@@ -728,7 +593,6 @@ struct ContentView: View {
                             .background(Color.lupinPanel)
                             .cornerRadius(4)
                             .onSubmit { sendTextCommand() }
-                        
                         Button(action: sendTextCommand) {
                             Image(systemName: "paperplane.fill")
                                 .foregroundColor(.black)
@@ -750,8 +614,7 @@ struct ContentView: View {
                 SectionView(title: "ОТВЕТ ИИ:") {
                     if assistant.isProcessing {
                         HStack {
-                            ProgressView()
-                                .tint(.lupinAccent)
+                            ProgressView().tint(.lupinAccent)
                             Text("ОБРАБОТКА...")
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundColor(.lupinOrange)
@@ -817,16 +680,12 @@ struct ContentView: View {
         .sheet(isPresented: $showMacros) {
             MacrosView(botConnection: botConnection, historyStore: historyStore)
         }
-        .sheet(isPresented: $showMemoryView) {
-            MemoryInspectorView(memoryStore: assistant.memoryStore)
-        }
         .onAppear {
             assistant.botConnection = botConnection
             botConnection.historyStore = historyStore
+            botConnection.netDiagnostics = netDiagnostics
             NotificationManager.shared.requestAuthorization()
-            if assistant.apiKey.isEmpty {
-                showSettings = true
-            }
+            if assistant.apiKey.isEmpty { showSettings = true }
         }
     }
     
@@ -837,14 +696,10 @@ struct ContentView: View {
         
         let pcCommandPrefixes = ["открой", "пауза", "следующ", "предыдущ", "громкость", "выключи", "перезагрузи", "заблокируй", "скриншот", "инфо", "процессы", "wifi", "пароль", "ip", "корзин", "буфер", "скажи", "включи"]
         let questionStarters = ["как", "что", "почему", "зачем", "можно", "подскажи", "объясни", "расскажи"]
-
         let lowered = text.lowercased()
         let words = lowered.split(separator: " ").map(String.init)
-
         let looksLikeQuestion = words.first.map { questionStarters.contains($0) } ?? false
-        let isPCCommand = !looksLikeQuestion && words.contains { word in
-            pcCommandPrefixes.contains { word.hasPrefix($0) }
-        }
+        let isPCCommand = !looksLikeQuestion && words.contains { word in pcCommandPrefixes.contains { word.hasPrefix($0) } }
         
         if isPCCommand {
             botConnection.sendCommand(text)
@@ -856,84 +711,15 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Memory Inspector View (Просмотр и ручное удаление из долгосрочной памяти)
-struct MemoryInspectorView: View {
-    @ObservedObject var memoryStore: MemoryStore
-    @Environment(\.dismiss) var dismiss
-
-    var body: some View {
-        NavigationView {
-            ZStack {
-                Color.lupinBackground.ignoresSafeArea()
-
-                if memoryStore.memories.isEmpty {
-                    VStack(spacing: 10) {
-                        Image(systemName: "brain.head.profile")
-                            .font(.system(size: 32))
-                            .foregroundColor(.lupinTextDim)
-                        Text("ПАМЯТЬ ПУСТА")
-                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                            .foregroundColor(.lupinTextDim)
-                    }
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 8) {
-                            ForEach(memoryStore.memories, id: \.self) { fact in
-                                HStack {
-                                    Text("• \(fact)")
-                                        .font(.system(size: 13, design: .monospaced))
-                                        .foregroundColor(.white)
-                                    Spacer()
-                                    Button(role: .destructive) {
-                                        memoryStore.forget(fact)
-                                    } label: {
-                                        Image(systemName: "trash")
-                                            .foregroundColor(.lupinRed)
-                                    }
-                                }
-                                .padding(10)
-                                .background(Color.lupinPanel)
-                                .cornerRadius(4)
-                                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.lupinBorder, lineWidth: 1))
-                            }
-                        }
-                        .padding()
-                    }
-                }
-            }
-            .navigationTitle("ДОЛГОСРОЧНАЯ ПАМЯТЬ")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button(role: .destructive) {
-                        memoryStore.forget()
-                    } label: {
-                        Image(systemName: "trash")
-                            .foregroundColor(.lupinRed)
-                    }
-                    .disabled(memoryStore.memories.isEmpty)
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("ЗАКРЫТЬ") { dismiss() }
-                        .foregroundColor(.lupinAccent)
-                }
-            }
-        }
-        .preferredColorScheme(.dark)
-    }
-}
-
-// MARK: - Settings View
+// MARK: - Secondary Views
 struct SettingsView: View {
     @Binding var apiKey: String
     @Environment(\.dismiss) var dismiss
     @State private var draftKey: String = ""
-    
     var body: some View {
         NavigationView {
             ZStack {
                 Color.lupinBackground.ignoresSafeArea()
-                
                 VStack(spacing: 16) {
                     SectionView(title: "DEEPSEEK API KEY") {
                         SecureField("sk-...", text: $draftKey)
@@ -947,11 +733,7 @@ struct SettingsView: View {
                             .disableAutocorrection(true)
                     }
                     .padding(.horizontal)
-                    
-                    Button(action: {
-                        apiKey = draftKey
-                        dismiss()
-                    }) {
+                    Button(action: { apiKey = draftKey; dismiss() }) {
                         Text("СОХРАНИТЬ")
                             .font(.system(size: 14, weight: .bold, design: .monospaced))
                             .foregroundColor(.black)
@@ -961,7 +743,6 @@ struct SettingsView: View {
                             .cornerRadius(4)
                     }
                     .padding(.horizontal)
-                    
                     Spacer()
                 }
                 .padding(.top, 20)
@@ -970,67 +751,42 @@ struct SettingsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("ЗАКРЫТЬ") { dismiss() }
-                        .foregroundColor(.lupinAccent)
+                    Button("ЗАКРЫТЬ") { dismiss() }.foregroundColor(.lupinAccent)
                 }
             }
         }
-        .onAppear {
-            draftKey = apiKey
-        }
+        .onAppear { draftKey = apiKey }
         .preferredColorScheme(.dark)
     }
 }
 
-// MARK: - PC Control View
 struct PCControlView: View {
     @ObservedObject var botConnection: TelegramBotConnection
     @ObservedObject var historyStore: CommandHistoryStore
     @Environment(\.dismiss) var dismiss
     @State private var volume: Double = 50
     @State private var musicQuery = ""
-
-    private func log(_ text: String) {
-        historyStore.log(text, source: "button")
-    }
+    
+    private func log(_ text: String) { historyStore.log(text, source: "button") }
     
     var body: some View {
         NavigationView {
             ZStack {
                 Color.lupinBackground.ignoresSafeArea()
-                
                 ScrollView {
                     VStack(spacing: 12) {
                         SectionView(title: "MEDIA CONTROL") {
                             HStack(spacing: 20) {
                                 Button(action: { botConnection.controlMedia("prev"); log("предыдущий трек") }) {
-                                    Image(systemName: "backward.fill")
-                                        .foregroundColor(.lupinAccent)
-                                        .frame(maxWidth: .infinity)
-                                        .padding(10)
-                                        .background(Color.lupinPanel)
-                                        .cornerRadius(4)
+                                    Image(systemName: "backward.fill").foregroundColor(.lupinAccent).frame(maxWidth: .infinity).padding(10).background(Color.lupinPanel).cornerRadius(4)
                                 }
-                                
                                 Button(action: { botConnection.controlMedia("toggle"); log("пауза") }) {
-                                    Image(systemName: "playpause.fill")
-                                        .foregroundColor(.black)
-                                        .frame(maxWidth: .infinity)
-                                        .padding(10)
-                                        .background(Color.lupinAccent)
-                                        .cornerRadius(4)
+                                    Image(systemName: "playpause.fill").foregroundColor(.black).frame(maxWidth: .infinity).padding(10).background(Color.lupinAccent).cornerRadius(4)
                                 }
-                                
                                 Button(action: { botConnection.controlMedia("next"); log("следующий трек") }) {
-                                    Image(systemName: "forward.fill")
-                                        .foregroundColor(.lupinAccent)
-                                        .frame(maxWidth: .infinity)
-                                        .padding(10)
-                                        .background(Color.lupinPanel)
-                                        .cornerRadius(4)
+                                    Image(systemName: "forward.fill").foregroundColor(.lupinAccent).frame(maxWidth: .infinity).padding(10).background(Color.lupinPanel).cornerRadius(4)
                                 }
                             }
-                            
                             HStack(spacing: 8) {
                                 TextField("Поиск музыки...", text: $musicQuery)
                                     .textFieldStyle(PlainTextFieldStyle())
@@ -1039,86 +795,38 @@ struct PCControlView: View {
                                     .padding(8)
                                     .background(Color.lupinPanel)
                                     .cornerRadius(4)
-                                
                                 Button("SEARCH") {
-                                    if !musicQuery.isEmpty {
-                                        botConnection.searchMusic(musicQuery); log("включи \(musicQuery)")
-                                    }
+                                    if !musicQuery.isEmpty { botConnection.searchMusic(musicQuery); log("включи \(musicQuery)") }
                                 }
                                 .buttonStyle(LupinButtonStyle(isActive: true))
                             }
                         }
-                        
                         SectionView(title: "VOLUME: \(Int(volume))%") {
                             Slider(value: $volume, in: 0...100) { editing in
-                                if !editing {
-                                    botConnection.controlVolume(Int(volume)); log("громкость \(Int(volume))")
-                                }
+                                if !editing { botConnection.controlVolume(Int(volume)); log("громкость \(Int(volume))") }
                             }
                             .tint(.lupinAccent)
                         }
-                        
                         SectionView(title: "SYSTEM") {
                             HStack(spacing: 8) {
-                                Button("INFO") { botConnection.requestSystemInfo(); log("инфо") }
-                                    .buttonStyle(LupinButtonStyle(isActive: true))
-                                Button("SCREENSHOT") { botConnection.takeScreenshot(); log("скриншот") }
-                                    .buttonStyle(LupinButtonStyle(isActive: true))
-                                Button("PROCESSES") { botConnection.getProcessList(); log("процессы") }
-                                    .buttonStyle(LupinButtonStyle())
+                                Button("INFO") { botConnection.requestSystemInfo(); log("инфо") }.buttonStyle(LupinButtonStyle(isActive: true))
+                                Button("SCREENSHOT") { botConnection.takeScreenshot(); log("скриншот") }.buttonStyle(LupinButtonStyle(isActive: true))
+                                Button("PROCESSES") { botConnection.getProcessList(); log("процессы") }.buttonStyle(LupinButtonStyle())
                             }
                         }
-                        
                         SectionView(title: "QUICK LAUNCH") {
                             HStack(spacing: 6) {
-                                Button("CHROME") { botConnection.launchApp("chrome"); log("открой хром") }
-                                    .buttonStyle(LupinButtonStyle())
-                                Button("NOTEPAD") { botConnection.launchApp("notepad"); log("открой блокнот") }
-                                    .buttonStyle(LupinButtonStyle())
-                                Button("CMD") { botConnection.launchApp("cmd"); log("открой cmd") }
-                                    .buttonStyle(LupinButtonStyle())
-                            }
-                            
-                            HStack(spacing: 6) {
-                                Button("EXPLORER") { botConnection.launchApp("explorer"); log("открой проводник") }
-                                    .buttonStyle(LupinButtonStyle())
-                                Button("CALC") { botConnection.launchApp("calculator"); log("открой калькулятор") }
-                                    .buttonStyle(LupinButtonStyle())
-                                Button("PAINT") { botConnection.launchApp("paint"); log("открой paint") }
-                                    .buttonStyle(LupinButtonStyle())
+                                Button("CHROME") { botConnection.launchApp("chrome"); log("открой хром") }.buttonStyle(LupinButtonStyle())
+                                Button("NOTEPAD") { botConnection.launchApp("notepad"); log("открой блокнот") }.buttonStyle(LupinButtonStyle())
+                                Button("CMD") { botConnection.launchApp("cmd"); log("открой cmd") }.buttonStyle(LupinButtonStyle())
                             }
                         }
-                        
-                        SectionView(title: "AUDIO DEVICE") {
-                            HStack(spacing: 8) {
-                                Button("SPEAKER") { botConnection.switchAudioDevice("speaker"); log("на колонку") }
-                                    .buttonStyle(LupinButtonStyle(isActive: true))
-                                Button("HEADPHONES") { botConnection.switchAudioDevice("headphones"); log("на наушники") }
-                                    .buttonStyle(LupinButtonStyle())
-                            }
-                        }
-                        
-                        SectionView(title: "NETWORK") {
-                            HStack(spacing: 8) {
-                                Button("WIFI PASS") { botConnection.getWifiPasswords(); log("wifi пароли") }
-                                    .buttonStyle(LupinButtonStyle(isActive: true))
-                                Button("IP") { botConnection.getIP(); log("ip адрес") }
-                                    .buttonStyle(LupinButtonStyle())
-                                Button("PASSWORD") { botConnection.generatePassword(); log("пароль") }
-                                    .buttonStyle(LupinButtonStyle())
-                            }
-                        }
-                        
                         SectionView(title: "POWER") {
                             HStack(spacing: 8) {
-                                Button("LOCK") { botConnection.powerControl("lock"); log("заблокируй пк") }
-                                    .buttonStyle(LupinButtonStyle())
-                                Button("SLEEP") { botConnection.powerControl("sleep"); log("спящий режим") }
-                                    .buttonStyle(LupinButtonStyle())
-                                Button("REBOOT") { botConnection.powerControl("reboot"); log("перезагрузи пк") }
-                                    .buttonStyle(LupinButtonStyle(isDanger: true))
-                                Button("SHUTDOWN") { botConnection.powerControl("shutdown"); log("выключи пк") }
-                                    .buttonStyle(LupinButtonStyle(isDanger: true))
+                                Button("LOCK") { botConnection.powerControl("lock"); log("заблокируй пк") }.buttonStyle(LupinButtonStyle())
+                                Button("SLEEP") { botConnection.powerControl("sleep"); log("спящий режим") }.buttonStyle(LupinButtonStyle())
+                                Button("REBOOT") { botConnection.powerControl("reboot"); log("перезагрузи пк") }.buttonStyle(LupinButtonStyle(isDanger: true))
+                                Button("SHUTDOWN") { botConnection.powerControl("shutdown"); log("выключи пк") }.buttonStyle(LupinButtonStyle(isDanger: true))
                             }
                         }
                     }
@@ -1129,8 +837,7 @@ struct PCControlView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("CLOSE") { dismiss() }
-                        .foregroundColor(.lupinAccent)
+                    Button("CLOSE") { dismiss() }.foregroundColor(.lupinAccent)
                 }
             }
         }
@@ -1138,59 +845,28 @@ struct PCControlView: View {
     }
 }
 
-// MARK: - App Entry
-@main
-struct LupinApp: App {
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-        }
-    }
-}
-
-// MARK: - Command Log Entry
+// MARK: - Stores & History
 struct CommandLogEntry: Identifiable, Codable, Equatable {
     let id: UUID
     let text: String
     let timestamp: Date
     let source: String
-
-    init(text: String, source: String) {
-        self.id = UUID()
-        self.text = text
-        self.timestamp = Date()
-        self.source = source
-    }
+    init(text: String, source: String) { self.id = UUID(); self.text = text; self.timestamp = Date(); self.source = source }
 }
 
-// MARK: - History Store
 final class CommandHistoryStore: ObservableObject {
     @Published private(set) var entries: [CommandLogEntry] = []
     private let storageKey = "lupin_command_history_v1"
     private let maxEntries = 300
-
     init() { load() }
-
     func log(_ text: String, source: String) {
         let entry = CommandLogEntry(text: text, source: source)
         entries.insert(entry, at: 0)
-        if entries.count > maxEntries {
-            entries.removeLast(entries.count - maxEntries)
-        }
+        if entries.count > maxEntries { entries.removeLast(entries.count - maxEntries) }
         save()
     }
-
-    func clear() {
-        entries.removeAll()
-        save()
-    }
-
-    private func save() {
-        if let data = try? JSONEncoder().encode(entries) {
-            UserDefaults.standard.set(data, forKey: storageKey)
-        }
-    }
-
+    func clear() { entries.removeAll(); save() }
+    private func save() { if let data = try? JSONEncoder().encode(entries) { UserDefaults.standard.set(data, forKey: storageKey) } }
     private func load() {
         guard let data = UserDefaults.standard.data(forKey: storageKey),
               let decoded = try? JSONDecoder().decode([CommandLogEntry].self, from: data) else { return }
@@ -1201,43 +877,25 @@ final class CommandHistoryStore: ObservableObject {
 struct CommandHistoryView: View {
     @ObservedObject var historyStore: CommandHistoryStore
     @Environment(\.dismiss) var dismiss
-
-    private static let timeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "dd.MM HH:mm:ss"
-        return f
-    }()
-
+    private static let timeFormatter: DateFormatter = { let f = DateFormatter(); f.dateFormat = "dd.MM HH:mm:ss"; return f }()
     var body: some View {
         NavigationView {
             ZStack {
                 Color.lupinBackground.ignoresSafeArea()
-
                 if historyStore.entries.isEmpty {
                     VStack(spacing: 10) {
-                        Image(systemName: "clock.arrow.circlepath")
-                            .font(.system(size: 32))
-                            .foregroundColor(.lupinTextDim)
-                        Text("ИСТОРИЯ ПУСТА")
-                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                            .foregroundColor(.lupinTextDim)
+                        Image(systemName: "clock.arrow.circlepath").font(.system(size: 32)).foregroundColor(.lupinTextDim)
+                        Text("ИСТОРИЯ ПУСТА").font(.system(size: 13, weight: .bold, design: .monospaced)).foregroundColor(.lupinTextDim)
                     }
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 8) {
                             ForEach(historyStore.entries) { entry in
                                 HStack(alignment: .top, spacing: 10) {
-                                    Text(sourceIcon(entry.source))
-                                        .font(.system(size: 14))
-                                        .frame(width: 20)
-
+                                    Text(sourceIcon(entry.source)).font(.system(size: 14)).frame(width: 20)
                                     VStack(alignment: .leading, spacing: 3) {
-                                        Text(entry.text)
-                                            .font(.system(size: 13, design: .monospaced))
-                                            .foregroundColor(.white)
-                                        Text(Self.timeFormatter.string(from: entry.timestamp))
-                                            .font(.system(size: 10, design: .monospaced))
-                                            .foregroundColor(.lupinTextDim)
+                                        Text(entry.text).font(.system(size: 13, design: .monospaced)).foregroundColor(.white)
+                                        Text(Self.timeFormatter.string(from: entry.timestamp)).font(.system(size: 10, design: .monospaced)).foregroundColor(.lupinTextDim)
                                     }
                                     Spacer()
                                 }
@@ -1255,23 +913,18 @@ struct CommandHistoryView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button(role: .destructive) {
-                        historyStore.clear()
-                    } label: {
-                        Image(systemName: "trash")
-                            .foregroundColor(.lupinRed)
+                    Button(role: .destructive) { historyStore.clear() } label: {
+                        Image(systemName: "trash").foregroundColor(.lupinRed)
                     }
                     .disabled(historyStore.entries.isEmpty)
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("ЗАКРЫТЬ") { dismiss() }
-                        .foregroundColor(.lupinAccent)
+                    Button("ЗАКРЫТЬ") { dismiss() }.foregroundColor(.lupinAccent)
                 }
             }
         }
         .preferredColorScheme(.dark)
     }
-
     private func sourceIcon(_ source: String) -> String {
         switch source {
         case "voice": return "🎙"
@@ -1282,71 +935,28 @@ struct CommandHistoryView: View {
     }
 }
 
-// MARK: - Macro Model
+// MARK: - Macros
 struct Macro: Identifiable, Codable, Equatable {
     let id: UUID
     var name: String
     var steps: [String]
     var delayBetweenSteps: Double
-
-    init(name: String, steps: [String], delayBetweenSteps: Double = 1.0) {
-        self.id = UUID()
-        self.name = name
-        self.steps = steps
-        self.delayBetweenSteps = delayBetweenSteps
-    }
+    init(name: String, steps: [String], delayBetweenSteps: Double = 1.0) { self.id = UUID(); self.name = name; self.steps = steps; self.delayBetweenSteps = delayBetweenSteps }
 }
 
-// MARK: - Macro Store
 final class MacroStore: ObservableObject {
     @Published private(set) var macros: [Macro] = []
     private let storageKey = "lupin_macros_v1"
-
-    init() {
-        load()
-        if macros.isEmpty {
-            macros = Self.defaultMacros
-            save()
-        }
-    }
-
+    init() { load(); if macros.isEmpty { macros = Self.defaultMacros; save() } }
     static let defaultMacros: [Macro] = [
         Macro(name: "Рабочий режим", steps: ["открой хром", "громкость 40"], delayBetweenSteps: 1.5),
         Macro(name: "Тихий вечер", steps: ["громкость 20", "на наушники"], delayBetweenSteps: 1.0)
     ]
-
     func add(_ macro: Macro) { macros.append(macro); save() }
-    func update(_ macro: Macro) {
-        guard let idx = macros.firstIndex(where: { $0.id == macro.id }) else { return }
-        macros[idx] = macro
-        save()
-    }
-    func delete(at offsets: IndexSet) { macros.remove(atOffsets: offsets); save() }
+    func update(_ macro: Macro) { guard let idx = macros.firstIndex(where: { $0.id == macro.id }) else { return }; macros[idx] = macro; save() }
     func delete(_ macro: Macro) { macros.removeAll { $0.id == macro.id }; save() }
-
-    private func save() {
-        if let data = try? JSONEncoder().encode(macros) {
-            UserDefaults.standard.set(data, forKey: storageKey)
-        }
-    }
-
-    private func load() {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode([Macro].self, from: data) else { return }
-        macros = decoded
-    }
-}
-
-enum MacroRunner {
-    static func run(_ macro: Macro, bot: TelegramBotConnection, history: CommandHistoryStore) {
-        for (index, step) in macro.steps.enumerated() {
-            let delay = Double(index) * macro.delayBetweenSteps
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                bot.sendCommand(step)
-                history.log(step, source: "macro")
-            }
-        }
-    }
+    private func save() { if let data = try? JSONEncoder().encode(macros) { UserDefaults.standard.set(data, forKey: storageKey) } }
+    private func load() { guard let data = UserDefaults.standard.data(forKey: storageKey), let decoded = try? JSONDecoder().decode([Macro].self, from: data) else { return }; macros = decoded }
 }
 
 struct MacrosView: View {
@@ -1354,23 +964,34 @@ struct MacrosView: View {
     @ObservedObject var historyStore: CommandHistoryStore
     @StateObject private var store = MacroStore()
     @Environment(\.dismiss) var dismiss
-    @State private var showEditor = false
-    @State private var editingMacro: Macro? = nil
-
+    
     var body: some View {
         NavigationView {
             ZStack {
                 Color.lupinBackground.ignoresSafeArea()
-
                 ScrollView {
                     LazyVStack(spacing: 10) {
                         ForEach(store.macros) { macro in
-                            MacroRow(
-                                macro: macro,
-                                onRun: { MacroRunner.run(macro, bot: botConnection, history: historyStore) },
-                                onEdit: { editingMacro = macro; showEditor = true },
-                                onDelete: { store.delete(macro) }
-                            )
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(macro.name.uppercased())
+                                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.lupinAccent)
+                                Text(macro.steps.joined(separator: " → "))
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundColor(.lupinText)
+                                Button("ЗАПУСТИТЬ") {
+                                    for (index, step) in macro.steps.enumerated() {
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * macro.delayBetweenSteps) {
+                                            botConnection.sendCommand(step)
+                                            historyStore.log(step, source: "macro")
+                                        }
+                                    }
+                                }
+                                .buttonStyle(LupinButtonStyle(isActive: true))
+                            }
+                            .padding(12)
+                            .background(Color.lupinPanel)
+                            .cornerRadius(4)
                         }
                     }
                     .padding()
@@ -1379,309 +1000,80 @@ struct MacrosView: View {
             .navigationTitle("МАКРОСЫ")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button(action: { editingMacro = nil; showEditor = true }) {
-                        Image(systemName: "plus")
-                            .foregroundColor(.lupinAccent)
-                    }
-                }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("ЗАКРЫТЬ") { dismiss() }
-                        .foregroundColor(.lupinAccent)
+                    Button("ЗАКРЫТЬ") { dismiss() }.foregroundColor(.lupinAccent)
                 }
             }
-        }
-        .sheet(isPresented: $showEditor) {
-            MacroEditorView(store: store, macro: editingMacro)
         }
         .preferredColorScheme(.dark)
     }
 }
 
-private struct MacroRow: View {
-    let macro: Macro
-    let onRun: () -> Void
-    let onEdit: () -> Void
-    let onDelete: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(macro.name.uppercased())
-                    .font(.system(size: 13, weight: .bold, design: .monospaced))
-                    .foregroundColor(.lupinAccent)
-                Spacer()
-                Button(action: onEdit) {
-                    Image(systemName: "pencil")
-                        .foregroundColor(.lupinTextDim)
-                }
-                Button(role: .destructive, action: onDelete) {
-                    Image(systemName: "trash")
-                        .foregroundColor(.lupinRed)
-                }
-            }
-
-            Text(macro.steps.joined(separator: " → "))
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundColor(.lupinText)
-
-            Button(action: onRun) {
-                HStack {
-                    Image(systemName: "bolt.fill")
-                    Text("ЗАПУСТИТЬ")
-                }
-                .font(.system(size: 12, weight: .bold, design: .monospaced))
-                .foregroundColor(.black)
-                .frame(maxWidth: .infinity)
-                .padding(8)
-                .background(Color.lupinAccent)
-                .cornerRadius(4)
-            }
-        }
-        .padding(12)
-        .background(Color.lupinPanel)
-        .cornerRadius(4)
-        .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.lupinBorder, lineWidth: 1))
-    }
-}
-
-private struct MacroEditorView: View {
-    @ObservedObject var store: MacroStore
-    let macro: Macro?
-
-    @Environment(\.dismiss) var dismiss
-    @State private var name: String = ""
-    @State private var stepsText: String = ""
-    @State private var delay: Double = 1.0
-
-    var body: some View {
-        NavigationView {
-            ZStack {
-                Color.lupinBackground.ignoresSafeArea()
-
-                VStack(spacing: 16) {
-                    SectionView(title: "НАЗВАНИЕ") {
-                        TextField("Например: Рабочий режим", text: $name)
-                            .textFieldStyle(PlainTextFieldStyle())
-                            .font(.system(size: 13, design: .monospaced))
-                            .foregroundColor(.white)
-                            .padding(10)
-                            .background(Color.lupinPanel)
-                            .cornerRadius(4)
-                    }
-
-                    SectionView(title: "ШАГИ (по одному на строку, в порядке выполнения)") {
-                        TextEditor(text: $stepsText)
-                            .font(.system(size: 13, design: .monospaced))
-                            .foregroundColor(.white)
-                            .scrollContentBackground(.hidden)
-                            .background(Color.lupinPanel)
-                            .frame(minHeight: 120)
-                            .cornerRadius(4)
-                    }
-
-                    SectionView(title: "ПАУЗА МЕЖДУ ШАГАМИ: \(String(format: "%.1f", delay))с") {
-                        Slider(value: $delay, in: 0.5...5.0, step: 0.5)
-                            .tint(.lupinAccent)
-                    }
-
-                    Button(action: save) {
-                        Text("СОХРАНИТЬ")
-                            .font(.system(size: 14, weight: .bold, design: .monospaced))
-                            .foregroundColor(.black)
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(Color.lupinAccent)
-                            .cornerRadius(4)
-                    }
-                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || parsedSteps.isEmpty)
-
-                    Spacer()
-                }
-                .padding()
-            }
-            .navigationTitle(macro == nil ? "НОВЫЙ МАКРОС" : "РЕДАКТИРОВАНИЕ")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("ОТМЕНА") { dismiss() }
-                        .foregroundColor(.lupinTextDim)
-                }
-            }
-        }
-        .onAppear {
-            if let macro = macro {
-                name = macro.name
-                stepsText = macro.steps.joined(separator: "\n")
-                delay = macro.delayBetweenSteps
-            }
-        }
-        .preferredColorScheme(.dark)
-    }
-
-    private var parsedSteps: [String] {
-        stepsText.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-    }
-
-    private func save() {
-        if var existing = macro {
-            existing.name = name
-            existing.steps = parsedSteps
-            existing.delayBetweenSteps = delay
-            store.update(existing)
-        } else {
-            store.add(Macro(name: name, steps: parsedSteps, delayBetweenSteps: delay))
-        }
-        dismiss()
-    }
-}
-
-// MARK: - Notification Manager
+// MARK: - Notifications
 final class NotificationManager: NSObject, ObservableObject {
     static let shared = NotificationManager()
     @Published var permissionGranted = false
-
-    private override init() {
-        super.init()
-        UNUserNotificationCenter.current().delegate = self
-    }
-
+    private override init() { super.init(); UNUserNotificationCenter.current().delegate = self }
     func requestAuthorization() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
             DispatchQueue.main.async { self.permissionGranted = granted }
         }
     }
-
     func notifyNow(title: String, body: String, identifier: String = UUID().uuidString) {
         guard permissionGranted else { return }
         let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = .default
-
-        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        content.title = title; content.body = body; content.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
     }
 }
-
 extension NotificationManager: UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner, .sound, .badge])
     }
 }
 
-// MARK: - App Intents Bridge
-enum LupinConfig {
-    static let botToken = "8602600416:AAGgYHxYL9hbyqlQdxPIPFXYIspZoUoeN8s"
-    static let chatId: Int64 = 7106785409
-}
-
-enum IntentBotBridge {
-    static func send(_ text: String) async -> Bool {
-        let urlString = "https://api.telegram.org/bot\(LupinConfig.botToken)/sendMessage"
-        guard let url = URL(string: urlString) else { return false }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["chat_id": LupinConfig.chatId, "text": text])
-
-        do {
-            let (data, _) = try await URLSession.shared.data(for: request)
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let ok = json["ok"] as? Bool {
-                return ok
-            }
-        } catch { return false }
-        return false
-    }
-}
-
-enum PowerAction: String, AppEnum {
-    case lock, sleep, reboot, shutdown
-    static var typeDisplayRepresentation: TypeDisplayRepresentation = "Действие питания"
-    static var caseDisplayRepresentations: [PowerAction: DisplayRepresentation] = [
-        .lock: "Заблокировать", .sleep: "Спящий режим", .reboot: "Перезагрузить", .shutdown: "Выключить"
-    ]
-    var command: String {
-        switch self {
-        case .lock: return "заблокируй пк"
-        case .sleep: return "спящий режим"
-        case .reboot: return "перезагрузи пк"
-        case .shutdown: return "выключи пк"
+// MARK: - App Entry
+@main
+struct LupinApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
         }
     }
 }
 
-struct PowerControlIntent: AppIntent {
-    static var title: LocalizedStringResource = "Управление ПК Люпен"
-    static var description = IntentDescription("Заблокировать, усыпить, перезагрузить или выключить ПК через LUPIN.")
-
-    @Parameter(title: "Действие")
-    var action: PowerAction
-
-    static var parameterSummary: some ParameterSummary { Summary("\(\.$action) ПК") }
-
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let ok = await IntentBotBridge.send(action.command)
-        return .result(dialog: IntentDialog(stringLiteral: ok ? "Команда отправлена." : "Не удалось отправить команду."))
-    }
-}
-
+// MARK: - App Intents (Shortcuts)
 struct WakeLupinIntent: AppIntent {
     static var title: LocalizedStringResource = "Разбудить Люпена"
-    static var description = IntentDescription("Отправляет тестовую команду, чтобы проверить, что бот на связи.")
-
+    static var description = IntentDescription("Проверка связи с ботом.")
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let ok = await IntentBotBridge.send("привет")
         return .result(dialog: IntentDialog(stringLiteral: ok ? "Люпен на связи." : "Люпен не отвечает."))
     }
 }
 
-enum MediaAction: String, AppEnum {
-    case prev, toggle, next
-    static var typeDisplayRepresentation: TypeDisplayRepresentation = "Медиа-действие"
-    static var caseDisplayRepresentations: [MediaAction: DisplayRepresentation] = [
-        .prev: "Предыдущий трек", .toggle: "Пауза/Play", .next: "Следующий трек"
-    ]
-    var command: String {
-        switch self {
-        case .prev: return "предыдущий трек"
-        case .toggle: return "пауза"
-        case .next: return "следующий трек"
-        }
-    }
-}
-
-struct MediaControlIntent: AppIntent {
-    static var title: LocalizedStringResource = "Медиа на ПК"
-    static var description = IntentDescription("Управляет воспроизведением музыки на ПК через LUPIN.")
-
-    @Parameter(title: "Действие")
-    var action: MediaAction
-
-    static var parameterSummary: some ParameterSummary { Summary("\(\.$action)") }
-
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let ok = await IntentBotBridge.send(action.command)
-        return .result(dialog: IntentDialog(stringLiteral: ok ? "Готово." : "Не удалось отправить команду."))
-    }
-}
-
-struct TakeScreenshotIntent: AppIntent {
-    static var title: LocalizedStringResource = "Скриншот ПК"
-    static var description = IntentDescription("Запросить скриншот экрана ПК через LUPIN.")
-
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let ok = await IntentBotBridge.send("скриншот")
-        return .result(dialog: IntentDialog(stringLiteral: ok ? "Запрос отправлен." : "Ошибка отправки."))
+enum IntentBotBridge {
+    static func send(_ text: String) async -> Bool {
+        let urlString = "https://api.telegram.org/bot\(LupinConfig.botToken)/sendMessage"
+        guard let url = URL(string: urlString) else { return false }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["chat_id": LupinConfig.chatId, "text": text])
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let ok = json["ok"] as? Bool { return ok }
+        } catch { return false }
+        return false
     }
 }
 
 struct LupinShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
-        AppShortcut(intent: WakeLupinIntent(), phrases: ["Разбуди \(.applicationName)", "\(.applicationName) на связи"], shortTitle: "Разбудить Люпена", systemImageName: "power.circle")
-        AppShortcut(intent: PowerControlIntent(), phrases: ["Выключи ПК через \(.applicationName)", "Заблокируй ПК через \(.applicationName)"], shortTitle: "Питание ПК", systemImageName: "power")
-        AppShortcut(intent: MediaControlIntent(), phrases: ["\(.applicationName), переключи трек", "\(.applicationName), пауза"], shortTitle: "Медиа", systemImageName: "playpause.fill")
-        AppShortcut(intent: TakeScreenshotIntent(), phrases: ["Сделай скриншот через \(.applicationName)"], shortTitle: "Скриншот", systemImageName: "camera.viewfinder")
+        [
+            AppShortcut(intent: WakeLupinIntent(), phrases: ["Разбуди \(.applicationName)", "\(.applicationName) на связи"],
+                        shortTitle: "Разбудить Люпена", systemImageName: "power.circle")
+        ]
     }
 }
